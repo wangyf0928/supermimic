@@ -260,6 +260,8 @@ class StateRepresentation(nn.Module, ABC):
   rep_state_dim: int
   prediction_dim: int
   num_joints: int
+  _default_joint_pos: torch.Tensor
+  _encoder_bias: tuple[slice, SimContext] | None = None
   actor_obs_mode: Literal["rep_state", "proprio"] = "rep_state"
 
   # Each channel group's nominal-error field on ``WorldModelLearnerCfg``. Every
@@ -308,6 +310,17 @@ class StateRepresentation(nn.Module, ABC):
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
     """Resolve env-dependent state needed by the reward and the proprio sensor."""
     self._soft_joint_pos_limits = env.scene["robot"].data.soft_joint_pos_limits[0]
+    columns = sim_context.find("encoder_bias")
+    self._encoder_bias = None if columns is None else (columns, sim_context)
+
+  def _sensed_joint_pos(
+    self, joint_pos: torch.Tensor, sim_ctx: torch.Tensor
+  ) -> torch.Tensor:
+    """Match the simulator's biased joint position relative to the default pose."""
+    if self._encoder_bias is not None:
+      columns, sim_context = self._encoder_bias
+      joint_pos = joint_pos + sim_context.denormalize(sim_ctx, columns)
+    return joint_pos - self._default_joint_pos
 
   @abstractmethod
   def joint_state(self, rep_state: torch.Tensor) -> torch.Tensor:
@@ -613,10 +626,10 @@ class GenCoordRepresentation(StateRepresentation):
     joint_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
-    del aux_state, sim_ctx
+    del aux_state
     _, g_b, _, w_b, _, _ = decompose_rep_state(rep_state)
     qj, vj = joint_state.chunk(2, dim=-1)
-    return torch.cat([g_b, w_b, qj - self._default_joint_pos, vj], dim=-1)
+    return torch.cat([g_b, w_b, self._sensed_joint_pos(qj, sim_ctx), vj], dim=-1)
 
 
 class MaxCoordRepresentation(StateRepresentation):
@@ -647,7 +660,6 @@ class MaxCoordRepresentation(StateRepresentation):
     self.register_buffer("_default_joint_pos", default_joint_pos, persistent=False)
     self.register_buffer("_gravity_w", torch.tensor([0.0, 0.0, -1.0]), persistent=False)
     self.analytic_ik: AnalyticIK  # set by bind
-    self._encoder_bias: tuple[slice, SimContext] | None = None
 
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
     super().bind(env, sim_context)
@@ -661,8 +673,6 @@ class MaxCoordRepresentation(StateRepresentation):
       self._default_joint_pos.device,
       self._default_joint_pos.dtype,
     )
-    columns = sim_context.find("encoder_bias")
-    self._encoder_bias = None if columns is None else (columns, sim_context)
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
     flat = full_state.reshape(-1, self.full_state_dim)
@@ -812,8 +822,5 @@ class MaxCoordRepresentation(StateRepresentation):
     projected_gravity = quat_apply_inverse(root_quat, g_w)
     _, _, _, avel, _, _ = decompose_maxcoord_rep_state(rep_state, self.num_bodies)
     joint_pos, joint_vel = joint_state.chunk(2, dim=-1)
-    joint_pos_rel = joint_pos - self._default_joint_pos
-    if self._encoder_bias is not None:
-      columns, sim_context = self._encoder_bias
-      joint_pos_rel = joint_pos_rel + sim_context.denormalize(sim_ctx, columns)
+    joint_pos_rel = self._sensed_joint_pos(joint_pos, sim_ctx)
     return torch.cat([projected_gravity, avel[..., 0, :], joint_pos_rel, joint_vel], -1)
