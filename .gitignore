@@ -218,3 +218,8 @@ __marimo__/
 **/logs/
 **/wandb/*
 **/artifacts/
+
+# Converted local reference motions (regenerate with convert_motions.py).
+motions_npz/
+motions/
+tmp/
