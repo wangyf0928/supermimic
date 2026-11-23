@@ -118,6 +118,8 @@ class WorldModelLearner:
       init_rep_state = all_rep_states[:, 0, :]
       init_aux = all_aux_states[:, 0, :]
 
+      # Replay windows exclude resets between their states. Reset-only DR is
+      # therefore constant for this whole rollout, including its final target.
       sim_ctx = td["sim_ctx"][:, 0]
 
       pred_rep_states, pred_aux_states = self._compiled_rollout(

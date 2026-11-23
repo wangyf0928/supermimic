@@ -396,3 +396,49 @@ def test_sample_causal_pads_at_buffer_start():
   assert (stamps <= newest[:, None]).all() and (stamps >= 0).all()
   # Sampling the very first frame pads every predecessor slot.
   assert padded[at_start][:, :-1].all()
+
+
+@pytest.mark.parametrize("num_steps", [13, 43])
+def test_reset_randomization_context_stays_with_its_episode(num_steps):
+  """WM windows and policy history must not mix DR samples across a reset.
+
+  The runner records pre-step state/context and the done resulting from that
+  step. Asynchronous termination and truncation change context on the next
+  stored frame; the final action in a WM window is deliberately not predicted.
+  """
+  torch.manual_seed(7)
+  num_envs = 3
+  schema = {**_schema(state_dim=2), "sim_ctx": FieldSpec(2)}
+  buf = ReplayBuffer(schema, buffer_size=17, num_envs=num_envs)
+  env_ids = torch.arange(num_envs, dtype=torch.float32)
+  periods = torch.tensor([4, 5, 6])
+  episodes = torch.zeros(num_envs)
+  for step in range(num_steps):
+    ended = (step + 1) % periods == 0
+    # Each env and episode gets distinct physical parameters, with a different
+    # scale/offset per channel so a wrong row or context column cannot pass.
+    context_id = 100 * episodes + env_ids
+    buf.insert(
+      TensorDict(
+        {
+          "state": torch.stack([env_ids, episodes], dim=-1),
+          "sim_ctx": torch.stack([context_id, 0.5 * context_id + 1], dim=-1),
+          "terminated": ended & (env_ids != 1),
+          "truncated": ended & (env_ids == 1),
+        },
+        batch_size=[num_envs],
+      )
+    )
+    episodes += ended
+
+  wm_window = buf.sample(sequence_length=4, batch_size=1000)
+  history, _ = buf.sample_causal(sequence_length=8, batch_size=1000)
+  for window in (wm_window, history):
+    state, context = window["state"], window["sim_ctx"]
+    assert (state == state[:, :1]).all()
+    assert (context == context[:, :1]).all()
+    expected_id = 100 * state[..., 1] + state[..., 0]
+    torch.testing.assert_close(context[..., 0], expected_id)
+    torch.testing.assert_close(context[..., 1], 0.5 * expected_id + 1)
+  assert wm_window["terminated"][:, -1].any()
+  assert wm_window["truncated"][:, -1].any()

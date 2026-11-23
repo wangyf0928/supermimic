@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import os
 from dataclasses import dataclass
 
@@ -40,6 +41,7 @@ class TrainConfig:
 
 
 def main() -> None:
+  faulthandler.enable()
   # Parse first argument to choose the task.
   all_tasks = list_tasks()
   chosen_task, remaining_args = tyro.cli(

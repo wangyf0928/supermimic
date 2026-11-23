@@ -52,6 +52,10 @@ class SuperMimicRunnerCfg:
   wandb_project: str = "supermimic"
   run_name: str | None = None
   wandb_run_path: str | None = None
+  """Warm-start only the world model from a W&B run (actor/critic start fresh)."""
+  resume: str | None = None
+  """Restore world model, actor and critic weights from a checkpoint directory
+  or wandb://ENTITY/PROJECT/RUN_ID. Optimizers, replay and counters start fresh."""
   headless: bool = True
   buffer_size: int = 1000
   representation: str = "gencoord"  # "gencoord" or "maxcoord"
@@ -85,6 +89,13 @@ class SuperMimicRunnerCfg:
   ('return' drives mjlab's 'external' mode)."""
   return_sampler: ReturnSamplerCfg = field(default_factory=ReturnSamplerCfg)
 
+  def __post_init__(self) -> None:
+    if self.resume is not None and self.wandb_run_path is not None:
+      raise ValueError(
+        "Use either --runner.resume (all network weights) or "
+        "--runner.wandb-run-path (world model only), not both."
+      )
+
 
 @dataclass
 class WorldModel:
@@ -101,10 +112,34 @@ class WorldModel:
     return {
       "dynamics": self.dynamics.state_dict(),
       "sim_context": self.sim_context.state_dict(),
+      "sim_context_schema": self.sim_context.schema(),
     }
 
   def load_bundle(self, bundle: dict) -> None:
     """Load a ``world_model.pt`` bundle."""
+    saved_schema = bundle.get("sim_context_schema")
+    if saved_schema is None:
+      raise ValueError(
+        "Checkpoint predates the expanded domain-randomization context. "
+        "Train a new world model and policy with the current configuration."
+      )
+
+    def layout(schema: dict) -> dict:
+      # Play may change sampling ranges; column meanings and nominal physics
+      # must still match. Saved mean/scale below retain the training normalizer.
+      return {
+        "version": schema["version"],
+        "specs": [
+          {key: value for key, value in spec.items() if key != "ranges"}
+          for spec in schema["specs"]
+        ],
+      }
+
+    if layout(saved_schema) != layout(self.sim_context.schema()):
+      raise ValueError(
+        "Checkpoint sim-context layout or nominal physics does not match the "
+        "environment. Train a new model for this domain-randomization context."
+      )
     self.dynamics.load_state_dict(bundle["dynamics"])
     self.sim_context.load_state_dict(bundle["sim_context"])
 
@@ -202,6 +237,47 @@ def load_wandb_checkpoint(wandb_run_path: str, wm: WorldModel, device: str) -> N
   )
 
 
+def load_training_checkpoint(
+  source: str,
+  wm: WorldModel,
+  policy_learner: BpttPolicyLearner,
+  device: str,
+) -> None:
+  """Restore network weights/buffers before any optimizer step or graph capture."""
+  if not source:
+    raise ValueError("--runner.resume needs a checkpoint directory or wandb:// run")
+  if source.startswith("wandb://"):
+    run_path = source.removeprefix("wandb://")
+    if len(run_path.split("/")) != 3 or not all(run_path.split("/")):
+      raise ValueError("Expected --runner.resume wandb://ENTITY/PROJECT/RUN_ID")
+    print(f"[INFO] Loading training weights from W&B: {run_path}")
+    model_dir = download_model_dir(wandb.Api().run(run_path))
+  else:
+    model_dir = Path(source).expanduser()
+
+  critic = getattr(policy_learner, "critic", None)
+  names = ["world_model", "actor"] + (["critic"] if critic is not None else [])
+  missing = [f"{name}.pt" for name in names if not (model_dir / f"{name}.pt").is_file()]
+  if missing:
+    raise FileNotFoundError(
+      f"Resume checkpoint directory '{model_dir}' is missing: {', '.join(missing)}. "
+      "Pass a directory containing the saved networks, or wandb://ENTITY/PROJECT/RUN_ID."
+    )
+  states = {
+    name: torch.load(model_dir / f"{name}.pt", map_location=device, weights_only=True)
+    for name in names
+  }
+  wm.load_bundle(states["world_model"])
+  # Copy into existing Parameters so newly created optimizers keep their references.
+  policy_learner.actor.load_state_dict(states["actor"], strict=True)
+  if critic is not None:
+    critic.load_state_dict(states["critic"], strict=True)
+  print(
+    f"[INFO] Restored {', '.join(names)} weights and normalization from {model_dir}"
+  )
+  print("[INFO] Weight resume: fresh optimizers, replay buffer, counters and W&B run.")
+
+
 class Ratio:
   def __init__(self, ratio: float) -> None:
     self._ratio = ratio
@@ -246,6 +322,8 @@ class SuperMimicRunner:
 
     self._init_common()
     self._init_policy()
+    if self.cfg.resume is not None:
+      load_training_checkpoint(self.cfg.resume, self._wm, self.policy_learner, device)
 
     self.logger = Logger(
       run_name=cfg.run_name,
@@ -456,7 +534,10 @@ class SuperMimicRunner:
       termination_softness=self.cfg.termination_softness,
     )
     if torch.cuda.is_available():
-      self.wm_env.step = torch.compile(self.wm_env.step)
+      # Bound FK kernel size to avoid Triton compilation failures.
+      self.wm_env.step = torch.compile(
+        self.wm_env.step, options={"max_fusion_size": 16}
+      )
       self.wm_env.reset = torch.compile(self.wm_env.reset)
 
     self._configure_reset_sampling()
@@ -527,6 +608,7 @@ class SuperMimicRunner:
 
       rep_state = self._representation.represent(curr_states)
       aux_state = self._representation.extract_aux_state(curr_states)
+      # Snapshot before stepping: auto-reset may resample physics in env.step().
       sim_ctx = self._sim_context.read(self.env.unwrapped)
       actor_td = self._build_sim_obs_td(
         rep_state, aux_state, sim_actor_obs, motion_times, sim_ctx

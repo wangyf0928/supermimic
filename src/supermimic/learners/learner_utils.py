@@ -46,7 +46,9 @@ def _optimize_step(
   """Run one optimizer step: zero_grad -> backward -> optional clip -> step."""
   for optimizer in optimizers:
     optimizer.zero_grad(set_to_none=True)
-  loss.backward()
+  # Keep lazy backward compilation off autograd worker threads.
+  with torch.autograd.set_multithreading_enabled(False):
+    loss.backward()
   grad_norm = None
   if params is not None and max_norm is not None:
     # Don't set error_if_nonfinite=True: it forces a per-step CPU<->GPU sync.

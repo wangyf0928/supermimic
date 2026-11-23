@@ -19,6 +19,7 @@ from supermimic.representations import (
   motion_anchor_window,
   motion_goal_window,
 )
+from supermimic.tasks.domain_randomization import make_domain_randomization_events
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
@@ -164,6 +165,7 @@ def gencoord_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = unitree_g1_flat_tracking_env_cfg(play=play)
 
   cfg.commands["motion"].anchor_body_name = "pelvis"
+  cfg.commands["motion"].viz.mode = "frames"  # Show root-only corrected targets.
 
   cfg.observations["actor"] = _sensor_actor_group()
 
@@ -184,11 +186,7 @@ def gencoord_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # Add goal observation group
   cfg.observations["goal"] = _goal_obs_group()
 
-  cfg.events = {
-    name: term
-    for name, term in cfg.events.items()
-    if name in {"foot_friction", "base_com", "encoder_bias"}
-  }
+  cfg.events = make_domain_randomization_events()
 
   cfg.rewards.pop("self_collisions", None)
   cfg.rewards["joint_limit"].weight = -2.0

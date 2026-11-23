@@ -83,6 +83,12 @@ def create_representation(
       rep.proprio_noise_bounds(num_actions, default_joint_pos.device),
       persistent=False,
     )
+  else:
+    rep.register_buffer(
+      "_rep_state_noise_bounds",
+      rep.rep_state_noise_bounds(default_joint_pos.device),
+      persistent=False,
+    )
   rep.dt = dt
   # Semi-implicit composition of `decimation` substeps under constant accel.
   rep.substep_coeff = (decimation + 1) / (2 * decimation)
@@ -343,6 +349,17 @@ class StateRepresentation(nn.Module, ABC):
     synthesized sensor and the real-sim / imagination history rings."""
     return obs + ((torch.rand_like(obs) * 2 - 1) * self._proprio_noise_bounds).detach()
 
+  @abstractmethod
+  def rep_state_noise_bounds(self, device: torch.device | str) -> torch.Tensor:
+    """Playback noise for representation channels with defined sensor noise."""
+    ...
+
+  def add_rep_state_noise(self, obs: torch.Tensor) -> torch.Tensor:
+    """Noise the playback actor's copy, preserving the clean dynamics state."""
+    return (
+      obs + ((torch.rand_like(obs) * 2 - 1) * self._rep_state_noise_bounds).detach()
+    )
+
   def compute_actor_sensor(
     self,
     rep_state: torch.Tensor,
@@ -482,6 +499,15 @@ class GenCoordRepresentation(StateRepresentation):
     flat = full_state.reshape(-1, self.full_state_dim)
     rep = compute_gencoord_state(flat)
     return rep.reshape(*full_state.shape[:-1], -1)
+
+  def rep_state_noise_bounds(self, device: torch.device | str) -> torch.Tensor:
+    # [height, gravity, linear velocity, angular velocity, joint pos, joint vel].
+    bounds = torch.zeros(self.rep_state_dim, device=device)
+    bounds[1:4] = PROPRIO_NOISE_HALF_WIDTHS["projected_gravity"]
+    bounds[7:10] = PROPRIO_NOISE_HALF_WIDTHS["base_ang_vel"]
+    bounds[10 : 10 + self.num_joints] = PROPRIO_NOISE_HALF_WIDTHS["joint_pos"]
+    bounds[10 + self.num_joints :] = PROPRIO_NOISE_HALF_WIDTHS["joint_vel"]
+    return bounds
 
   def extract_aux_state(self, full_state: torch.Tensor) -> torch.Tensor:
     return full_state[..., :7]
@@ -642,6 +668,15 @@ class MaxCoordRepresentation(StateRepresentation):
     flat = full_state.reshape(-1, self.full_state_dim)
     rep = compute_maxcoord_rep_state(flat, self.num_bodies)
     return rep.reshape(*full_state.shape[:-1], -1)
+
+  def rep_state_noise_bounds(self, device: torch.device | str) -> torch.Tensor:
+    # Body pose/linear velocity have no sensor-noise definition. Only the root
+    # IMU channels map directly to the existing proprio noise ranges.
+    bounds = torch.zeros(self.rep_state_dim, device=device)
+    root_avel = 12 * self.num_bodies
+    bounds[root_avel : root_avel + 3] = PROPRIO_NOISE_HALF_WIDTHS["base_ang_vel"]
+    bounds[-3:] = PROPRIO_NOISE_HALF_WIDTHS["projected_gravity"]
+    return bounds
 
   def extract_aux_state(self, full_state: torch.Tensor) -> torch.Tensor:
     B = self.num_bodies

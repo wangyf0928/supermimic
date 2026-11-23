@@ -124,6 +124,15 @@ class SuperMimicViewerMixin:
       return sensor.unsqueeze(1).repeat(1, history_length, 1)
     return torch.cat([history[:, 1:], sensor.unsqueeze(1)], dim=1)
 
+  def _play_actor_sensor(self, rep_state: torch.Tensor, **kwargs) -> torch.Tensor:
+    """Apply noise once to the real-sim policy observation, before history."""
+    sensor = self.representation.compute_actor_sensor(
+      rep_state, self.sim_ctx, noisy=True, **kwargs
+    )
+    if self.representation.actor_obs_mode == "rep_state":
+      sensor = self.representation.add_rep_state_noise(sensor)
+    return sensor
+
   def _build_actor_goal(
     self, curr_goals: torch.Tensor, aux_state: torch.Tensor
   ) -> torch.Tensor:
@@ -244,9 +253,8 @@ class SuperMimicViewerMixin:
         actor_goal = self._build_actor_goal(curr_goals, gt_aux)
         gt_rep_state = self.representation.represent(curr_gt_states)
         proprio = self.representation.actor_obs_mode == "proprio"
-        sensor = self.representation.compute_actor_sensor(
+        sensor = self._play_actor_sensor(
           gt_rep_state,
-          self.sim_ctx,
           sim_actor_obs=obs["actor"] if proprio else None,
         )
         self._gt_history = self._advance_history(self._gt_history, sensor)
@@ -275,6 +283,7 @@ class SuperMimicViewerMixin:
           aux_state=self.curr_wm_aux,
           joint_state=self.representation.joint_state(self.curr_pred_rep_state),
           last_action=self.last_actions,
+          noisy=False,
         )
         self._wm_history = self._advance_history(self._wm_history, wm_sensor)
         wm_actor_obs = build_actor_obs_td(
@@ -470,6 +479,10 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     if self._supports_clip_selection():
       with self._sim_lock:
         self._apply_selected_clip()
+
+  def _handle_gui_reset(self, all_envs: bool) -> None:
+    super()._handle_gui_reset(all_envs)
+    self.reset_wm_visualizer()
 
   def _supports_clip_selection(self) -> bool:
     return bool(self.motion_names)

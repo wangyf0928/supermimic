@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from supermimic.sim_context import (
+  BodyCoMOffsetSpec,
+  BodyMassScaleSpec,
   CoMOffsetSpec,
   EncoderBiasSpec,
   FootFrictionSpec,
+  JointArmatureSpec,
+  PdGainsSpec,
   SimContext,
 )
 
@@ -374,3 +379,169 @@ class TestFromEnv:
       "base_com",
       "encoder_bias",
     ]
+
+
+def _parameter_env():
+  """Two worlds with noncontiguous, permuted robot indices and free-root DoFs."""
+  from mjlab.actuator import BuiltinPositionActuator
+  from mjlab.actuator.actuator import TransmissionType
+
+  actuator = object.__new__(BuiltinPositionActuator)
+  actuator.cfg = SimpleNamespace(transmission_type=TransmissionType.JOINT)
+  actuator._target_ids = torch.tensor([1, 0])
+  actuator._global_ctrl_ids = torch.tensor([2, 4])
+  asset = SimpleNamespace(
+    num_joints=2,
+    joint_names=("hip", "knee"),
+    body_names=("pelvis", "massless_link"),
+    actuators=[actuator],
+    indexing=SimpleNamespace(
+      body_ids=torch.tensor([3, 1]), joint_v_adr=torch.tensor([8, 6])
+    ),
+  )
+  defaults = {
+    "actuator_gainprm": torch.zeros(6, 10),
+    "actuator_biasprm": torch.zeros(6, 10),
+    "dof_armature": torch.zeros(10),
+    "body_mass": torch.zeros(5),
+    "body_ipos": torch.zeros(5, 3),
+  }
+  defaults["actuator_gainprm"][[4, 2], 0] = torch.tensor([40.0, 20.0])
+  defaults["actuator_biasprm"][[4, 2], 2] = torch.tensor([-4.0, -2.0])
+  defaults["dof_armature"][[8, 6]] = torch.tensor([0.04, 0.02])
+  defaults["body_mass"][3] = 3.0
+  defaults["body_ipos"][[3, 1]] = torch.tensor([[0.2, -0.1, 0.3], [1.0, 2.0, 3.0]])
+  model = SimpleNamespace(
+    **{
+      field: default.unsqueeze(0).repeat(2, *([1] * default.ndim))
+      for field, default in defaults.items()
+    }
+  )
+  asset_cfg = SimpleNamespace(name="robot")
+  events = {
+    "pd_gains": SimpleNamespace(
+      params={
+        "asset_cfg": asset_cfg,
+        "kp_range": (0.75, 1.25),
+        "kd_range": (0.75, 1.25),
+      }
+    ),
+    "joint_armature": SimpleNamespace(
+      params={
+        "asset_cfg": asset_cfg,
+        "ranges": (0.75, 1.25),
+      }
+    ),
+    "body_mass": SimpleNamespace(
+      params={
+        "asset_cfg": asset_cfg,
+        "ranges": (0.75, 1.25),
+      }
+    ),
+    "body_com": SimpleNamespace(
+      params={
+        "asset_cfg": asset_cfg,
+        "ranges": {0: (-0.03, 0.03), 1: (-0.02, 0.02), 2: (-0.01, 0.01)},
+      }
+    ),
+  }
+  env = _env(events=events, scene={"robot": asset}, sim_model=model, num_envs=2)
+  env.sim.get_default_field = defaults.__getitem__
+  env.sim.per_world_default_fields = set()
+  return env
+
+
+def test_pd_context_uses_joint_order_and_reads_live_per_env_parameters():
+  env = _parameter_env()
+  spec = PdGainsSpec()
+  assert spec.bind(env) == [(0.75, 1.25)] * 4
+  assert torch.equal(spec.read(env), torch.ones(2, 4))
+  # Simulate an episode reset resampling only world zero, after bind().
+  env.sim.model.actuator_gainprm[0, 4, 0] *= 0.75
+  env.sim.model.actuator_gainprm[0, 2, 0] *= 1.25
+  env.sim.model.actuator_biasprm[0, 4, 2] *= 1.25
+  env.sim.model.actuator_biasprm[0, 2, 2] *= 0.75
+  assert torch.equal(
+    spec.read(env), torch.tensor([[0.75, 1.25, 1.25, 0.75], [1.0] * 4])
+  )
+
+
+def test_armature_context_excludes_free_root_and_uses_original_defaults():
+  env = _parameter_env()
+  # Startup randomization happens before the world-model context is bound.
+  env.sim.model.dof_armature[0, 8] *= 0.75
+  env.sim.model.dof_armature[1, 6] *= 1.25
+  env.sim.model.dof_armature[:, :6] = 99.0
+  spec = JointArmatureSpec()
+  spec.bind(env)
+  torch.testing.assert_close(spec.read(env), torch.tensor([[0.75, 1.0], [1.0, 1.25]]))
+
+
+def test_mass_and_com_context_read_every_body_with_global_indices():
+  env = _parameter_env()
+  mass, com = BodyMassScaleSpec(), BodyCoMOffsetSpec()
+  mass.bind(env)
+  com.bind(env)
+  env.sim.model.body_mass[0, 3] *= 1.25
+  env.sim.model.body_mass[1, 3] *= 0.75
+  offsets = torch.tensor([[0.03, -0.02, 0.01], [-0.03, 0.02, -0.01]])
+  env.sim.model.body_ipos[:, 3] += offsets
+  env.sim.model.body_ipos[:, 1] -= offsets
+  torch.testing.assert_close(mass.read(env), torch.tensor([[1.25, 1.0], [0.75, 1.0]]))
+  torch.testing.assert_close(com.read(env), torch.cat([offsets, -offsets], dim=-1))
+
+
+@pytest.mark.parametrize(
+  "spec_type,field,global_id",
+  [
+    (JointArmatureSpec, "dof_armature", 8),
+    (BodyMassScaleSpec, "body_mass", 3),
+  ],
+)
+def test_zero_nominal_scale_is_finite_and_neutral(spec_type, field, global_id):
+  env = _parameter_env()
+  env.sim.get_default_field(field)[global_id] = 0
+  getattr(env.sim.model, field)[:, global_id] = 0
+  spec = spec_type()
+  spec.bind(env)
+  assert torch.isfinite(spec.read(env)).all()
+  assert torch.equal(spec.read(env)[:, 0], torch.ones(2))
+
+
+def test_parameter_context_normalization_and_schema_match_column_semantics():
+  env = _parameter_env()
+  ctx = SimContext.from_env(env)
+  assert ctx.output_dim == 14
+  assert torch.equal(ctx.read(env), torch.zeros(2, 14))
+  env.sim.model.actuator_gainprm[0, 4, 0] *= 1.25
+  env.sim.model.body_ipos[0, 3, 0] += 0.03
+  torch.testing.assert_close(ctx.read(env)[0, [0, 8]], torch.ones(2))
+  assert torch.equal(ctx.read(env)[1], torch.zeros(14))
+  schema = json.loads(json.dumps(ctx.schema()))
+  assert schema["version"] == 1
+  assert [s["name"] for s in schema["specs"]] == [
+    "pd_gains",
+    "joint_armature",
+    "body_mass",
+    "body_com",
+  ]
+  assert schema["specs"][0]["channels"] == [
+    "robot/kp/hip",
+    "robot/kp/knee",
+    "robot/kd/hip",
+    "robot/kd/knee",
+  ]
+  assert schema["specs"][0]["nominal"] == [40.0, 20.0, 4.0, 2.0]
+  assert schema["specs"][3]["representation"] == "offset"
+
+
+def test_variant_nominal_armatures_are_read_per_world():
+  env = _parameter_env()
+  default = env.sim.get_default_field("dof_armature").repeat(2, 1)
+  default[1] *= 2
+  env.sim.per_world_default_fields = {"dof_armature"}
+  env.sim.get_default_field = lambda field: default
+  env.sim.model.dof_armature = default * 0.75
+  spec = JointArmatureSpec()
+  spec.bind(env)
+  torch.testing.assert_close(spec.read(env), torch.full((2, 2), 0.75))

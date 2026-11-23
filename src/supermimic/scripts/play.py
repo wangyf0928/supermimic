@@ -49,7 +49,10 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   print(f"[INFO] Loading environment: {task_id}")
   env_cfg = load_env_cfg(task_id, play=True)
   env_cfg.scene.num_envs = 1
-  env_cfg.observations["actor"].enable_corruption = True
+  env_cfg.sim.mujoco.iterations = 50
+  env_cfg.sim.mujoco.ls_iterations = 50
+  # The viewer noises the real-sim policy input exactly once, in either obs mode.
+  env_cfg.observations["actor"].enable_corruption = False
 
   import wandb
 
@@ -57,6 +60,10 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   run = wandb.Api().run(cfg.wandb_path)
   runner_cfg = load_runner_cfg(run.config)
   check_representation_matches(task_id, runner_cfg.representation)
+  print(
+    f"[INFO] Observation noise: real-sim policy ON ({runner_cfg.actor_obs}), "
+    "WM viewer policy OFF"
+  )
 
   motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   command_term = env_cfg.commands["motion"]

@@ -37,6 +37,17 @@ _ENTITY_IDS_ATTR = {"body": "body_ids", "site": "site_ids", "geom": "geom_ids"}
 class SimContextSpec(ABC):
   name: str
   dim: int
+  representation = "absolute"
+
+  def schema(self) -> dict:
+    """Describe column meaning without scene-dependent global model indices."""
+    return {
+      "name": self.name,
+      "channels": getattr(
+        self, "channels", [f"{self.name}/{i}" for i in range(self.dim)]
+      ),
+      "representation": self.representation,
+    }
 
   @abstractmethod
   def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
@@ -91,6 +102,7 @@ class FootFrictionSpec(SimContextSpec):
         f"FootFrictionSpec: no geoms in '{asset_cfg.name}' match {pattern!r}"
       )
     self._geom_idx = self._global_entity_id(asset, "geom", matches[0])
+    self.channels = [f"{asset_cfg.name}/foot_friction"]
     return [ranges[0] if isinstance(ranges, dict) else ranges]
 
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -122,6 +134,7 @@ class CoMOffsetSpec(SimContextSpec):
     self._body_id = self._global_entity_id(
       asset, "body", asset.body_names.index(body_name)
     )
+    self.channels = [f"{asset_cfg.name}/{body_name}/{axis}" for axis in "xyz"]
     return [ranges[i] for i in range(self.dim)]
 
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -144,7 +157,10 @@ class EncoderBiasSpec(SimContextSpec):
     params = event_cfg.params
     asset_cfg = params["asset_cfg"]
     self._asset_name = asset_cfg.name
-    self.dim = env.scene[self._asset_name].num_joints
+    asset = env.scene[self._asset_name]
+    self.dim = asset.num_joints
+    joint_names = getattr(asset, "joint_names", range(self.dim))
+    self.channels = [f"{self._asset_name}/{name}" for name in joint_names]
     return [params["bias_range"]] * self.dim
 
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -153,10 +169,173 @@ class EncoderBiasSpec(SimContextSpec):
     return env.scene[self._asset_name].data.encoder_bias
 
 
+def _event_asset(env: ManagerBasedRlEnv, name: str, operation: str):
+  event = env.cfg.events.get(name)
+  if event is None:
+    raise RuntimeError(f"No event '{name}' on env.cfg.events")
+  params = event.params
+  if params.get("operation", operation) != operation:
+    raise ValueError(f"Sim context '{name}' requires operation={operation!r}")
+  return params, env.scene[params["asset_cfg"].name]
+
+
+def _nominal_field(env: ManagerBasedRlEnv, field: str, ids: torch.Tensor):
+  """Read unrandomized compiled defaults, including per-world variant defaults."""
+  default = env.sim.get_default_field(field)
+  if field in getattr(env.sim, "per_world_default_fields", ()):
+    return default[:, ids].clone()
+  return default[ids].unsqueeze(0).clone()
+
+
+class _ModelParameterSpec(SimContextSpec):
+  """Scale/offset context based on original model values, never sampled caches."""
+
+  dim = 0
+  representation = "scale"
+
+  def __init__(self) -> None:
+    self._ids: torch.Tensor | None = None
+    self._nominal: torch.Tensor | None = None
+
+  def _transform(self, raw: torch.Tensor) -> torch.Tensor:
+    assert self._nominal is not None
+    if self.representation == "offset":
+      return raw - self._nominal
+    # Multiplicative DR cannot change zero-mass links or zero armatures. Their
+    # scale is unobservable, so represent them by the neutral scale of one.
+    nonzero = self._nominal != 0
+    denominator = torch.where(nonzero, self._nominal, 1.0)
+    return torch.where(nonzero, raw / denominator, 1.0)
+
+  def _require_bound(self) -> torch.Tensor:
+    if self._ids is None:
+      raise RuntimeError(f"{type(self).__name__}.read() called before bind()")
+    return self._ids
+
+  def schema(self) -> dict:
+    result = super().schema()
+    if self._nominal is not None:
+      nominal = self._nominal.detach().cpu()
+      # A shared baseline does not depend on the number of play environments.
+      result["nominal"] = (nominal[0] if nominal.shape[0] == 1 else nominal).tolist()
+    return result
+
+
+class PdGainsSpec(_ModelParameterSpec):
+  """All joint kp scales followed by all kd scales, both in joint order."""
+
+  name = "pd_gains"
+
+  def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
+    from mjlab.actuator import BuiltinPositionActuator
+    from mjlab.actuator.actuator import TransmissionType
+
+    params, asset = _event_asset(env, self.name, "scale")
+    controls: dict[int, int] = {}
+    for actuator in asset.actuators:
+      if not isinstance(actuator, BuiltinPositionActuator) or (
+        actuator.transmission_type != TransmissionType.JOINT
+      ):
+        raise ValueError("pd_gains context requires joint BuiltinPositionActuators")
+      for joint, control in zip(
+        actuator.target_ids.tolist(), actuator.global_ctrl_ids.tolist(), strict=True
+      ):
+        if joint in controls:
+          raise ValueError(f"pd_gains context: joint {joint} has multiple actuators")
+        controls[joint] = control
+    if set(controls) != set(range(asset.num_joints)):
+      raise ValueError("pd_gains context requires one position actuator per joint")
+    self._ids = torch.tensor(
+      [controls[joint] for joint in range(asset.num_joints)],
+      dtype=torch.long,
+      device=env.device,
+    )
+    kp = _nominal_field(env, "actuator_gainprm", self._ids)[..., 0]
+    kd = -_nominal_field(env, "actuator_biasprm", self._ids)[..., 2]
+    self._nominal = torch.cat((kp, kd), dim=-1)
+    self.dim = 2 * asset.num_joints
+    asset_name = params["asset_cfg"].name
+    self.channels = [
+      f"{asset_name}/{gain}/{joint}"
+      for gain in ("kp", "kd")
+      for joint in asset.joint_names
+    ]
+    return [params["kp_range"]] * asset.num_joints + [
+      params["kd_range"]
+    ] * asset.num_joints
+
+  def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    ids = self._require_bound()
+    kp = env.sim.model.actuator_gainprm[:, ids, 0]
+    kd = -env.sim.model.actuator_biasprm[:, ids, 2]
+    return self._transform(torch.cat((kp, kd), dim=-1))
+
+
+class JointArmatureSpec(_ModelParameterSpec):
+  name = "joint_armature"
+
+  def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
+    params, asset = _event_asset(env, self.name, "scale")
+    self._ids = asset.indexing.joint_v_adr.to(dtype=torch.long)
+    if self._ids.numel() != asset.num_joints:
+      raise ValueError("joint_armature context requires single-DoF joints")
+    self._nominal = _nominal_field(env, "dof_armature", self._ids)
+    self.dim = asset.num_joints
+    self.channels = [
+      f"{params['asset_cfg'].name}/{joint}" for joint in asset.joint_names
+    ]
+    return [params["ranges"]] * self.dim
+
+  def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    return self._transform(env.sim.model.dof_armature[:, self._require_bound()])
+
+
+class BodyMassScaleSpec(_ModelParameterSpec):
+  name = "body_mass"
+
+  def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
+    params, asset = _event_asset(env, self.name, "scale")
+    self._ids = asset.indexing.body_ids.to(dtype=torch.long)
+    self._nominal = _nominal_field(env, "body_mass", self._ids)
+    self.dim = len(asset.body_names)
+    self.channels = [f"{params['asset_cfg'].name}/{body}" for body in asset.body_names]
+    return [params["ranges"]] * self.dim
+
+  def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    return self._transform(env.sim.model.body_mass[:, self._require_bound()])
+
+
+class BodyCoMOffsetSpec(_ModelParameterSpec):
+  """All local inertial-position offsets, relative to each body's nominal COM."""
+
+  name = "body_com"
+  representation = "offset"
+
+  def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
+    params, asset = _event_asset(env, self.name, "add")
+    self._ids = asset.indexing.body_ids.to(dtype=torch.long)
+    nominal = _nominal_field(env, "body_ipos", self._ids)
+    self._nominal = nominal.flatten(start_dim=1)
+    self.dim = 3 * len(asset.body_names)
+    self.channels = [
+      f"{params['asset_cfg'].name}/{body}/{axis}"
+      for body in asset.body_names
+      for axis in "xyz"
+    ]
+    ranges = params["ranges"]
+    axes = [ranges[i] for i in range(3)] if isinstance(ranges, dict) else [ranges] * 3
+    return axes * len(asset.body_names)
+
+  def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    raw = env.sim.model.body_ipos[:, self._require_bound(), :].flatten(start_dim=1)
+    return self._transform(raw)
+
+
 class SimContext(nn.Module):
   def __init__(self, specs: list[SimContextSpec], ranges: list[tuple[float, float]]):
     super().__init__()
     self.specs = list(specs)
+    self._ranges = [list(r) for r in ranges]
     stats = [_mean_scale(lo, hi) for lo, hi in ranges]
     self.register_buffer("mean", torch.tensor([m for m, _ in stats]))
     self.register_buffer("scale", torch.tensor([s for _, s in stats]))
@@ -172,15 +351,31 @@ class SimContext(nn.Module):
       FootFrictionSpec,
       CoMOffsetSpec,
       EncoderBiasSpec,
+      PdGainsSpec,
+      JointArmatureSpec,
+      BodyMassScaleSpec,
+      BodyCoMOffsetSpec,
     )
-    specs = [c() for c in candidates if c.name in env.cfg.events]
+    specs = [
+      candidate() for candidate in candidates if candidate.name in env.cfg.events
+    ]
     if not specs:
       raise RuntimeError(
         "No sim_ctx specs derived from env.cfg.events. "
-        "Enable at least one DR event (foot_friction, base_com, encoder_bias) "
-        "in the task cfg."
+        "Enable at least one supported DR event in the task cfg."
       )
     return cls(specs, [r for s in specs for r in s.bind(env)]).to(env.device)
+
+  def schema(self) -> dict:
+    """JSON-compatible layout/baselines for checkpoint compatibility checks."""
+    specs = []
+    start = 0
+    for spec in self.specs:
+      entry = spec.schema()
+      entry["ranges"] = self._ranges[start : start + spec.dim]
+      specs.append(entry)
+      start += spec.dim
+    return {"version": 1, "specs": specs}
 
   @property
   def output_dim(self) -> int:

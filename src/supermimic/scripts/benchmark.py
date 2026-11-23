@@ -86,7 +86,6 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       wm.load_bundle(bundle)
       wm.dynamics.eval()
       representation = wm.representation
-      sim_ctx = wm.sim_context.read(env.unwrapped)
 
       policy = None
       if cfg.use_policy:
@@ -108,6 +107,8 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       for _ in range(cfg.steps):
         with torch.inference_mode():
           if policy is not None:
+            # Resets resample physics, including those inside env.step().
+            sim_ctx = wm.sim_context.read(env.unwrapped)
             rep_state = representation.represent(obs["full_state"])
             sensor = representation.compute_actor_sensor(
               rep_state,
