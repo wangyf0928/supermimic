@@ -13,6 +13,8 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "mjlab",
     "ruff>=0.14.10",
+    "setuptools<82",  # TensorBoard 2.20 imports pkg_resources to start its web server.
+    "tensorboard>=2.20.0",
     "viser>=1.0.24",
 ]
 

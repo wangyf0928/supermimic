@@ -7,7 +7,10 @@ from collections.abc import Callable, Iterable, Sequence
 
 import torch
 import torch.nn as nn
+from rsl_rl.utils import reduce_gradients_in_buckets
 from tensordict import TensorDict
+
+from supermimic.distributed import world_size
 
 
 def build_optimizers(
@@ -43,12 +46,23 @@ def _optimize_step(
   max_norm: float | None = None,
   clip_value: float = 0.0,
 ) -> torch.Tensor | None:
-  """Run one optimizer step: zero_grad -> backward -> optional clip -> step."""
+  """Backpropagate, average gradients across workers, clip, then step."""
   for optimizer in optimizers:
     optimizer.zero_grad(set_to_none=True)
   # Keep lazy backward compilation off autograd worker threads.
   with torch.autograd.set_multithreading_enabled(False):
     loss.backward()
+  workers = world_size()
+  if workers > 1:
+    # Task slots and minibatch sizes match on all ranks, so disabled encoders
+    # have None gradients everywhere and remain untouched by both optimizers.
+    optimized_params = (
+      p
+      for optimizer in optimizers
+      for group in optimizer.param_groups
+      for p in group["params"]
+    )
+    reduce_gradients_in_buckets(optimized_params, workers, bucket_mb=25)
   grad_norm = None
   if params is not None and max_norm is not None:
     # Don't set error_if_nonfinite=True: it forces a per-step CPU<->GPU sync.
@@ -110,6 +124,10 @@ class CapturedUpdate:
     self._outputs: dict[str, torch.Tensor] = {}
 
   def __call__(self, inputs: TensorDict) -> dict[str, torch.Tensor]:
+    # Run collectives outside the per-process CUDA graphs. The forward and
+    # backward kernels used by fn still benefit from torch.compile.
+    if world_size() > 1:
+      return self._fn(inputs)
     state = self._state()
     if not state[0].is_cuda:
       return self._fn(inputs)

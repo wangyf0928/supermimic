@@ -93,8 +93,9 @@ class ReplayBuffer:
     slot = (base + torch.where(reachable, ages, first_age)) % T
     return self._storage[env_idx[:, None], slot], ~reachable
 
-  def sample(self, sequence_length: int, batch_size: int) -> TensorDict:
-    L, B, E, T = sequence_length, batch_size, self.num_envs, self.buffer_size
+  def valid_starts(self, sequence_length: int) -> torch.Tensor:
+    """Mask of filled windows that stay in one episode, indexed by env and age."""
+    L, E, T = sequence_length, self.num_envs, self.buffer_size
     dev, n = self.device, self.num_transitions
     if L > T:
       raise ValueError(f"sequence_length {L} exceeds buffer_size {T}")
@@ -109,8 +110,22 @@ class ReplayBuffer:
     c = torch.cat(
       [ended.new_zeros(E, 1), ended.cumsum(1), ended.new_zeros(E, L - 1)], dim=1
     )
-    valid = (c[:, L - 1 : L - 1 + T] == c[:, :T]) & (ages + L - 1 < n)
-    csum = valid.cumsum(dim=1, dtype=torch.long)
+    return (c[:, L - 1 : L - 1 + T] == c[:, :T]) & (ages + L - 1 < n)
+
+  def sample(
+    self,
+    sequence_length: int,
+    batch_size: int,
+    *,
+    valid_starts: torch.Tensor | None = None,
+  ) -> TensorDict:
+    """Draw env-stratified windows. A supplied valid_starts mask expires on insert."""
+    L, B, T = sequence_length, batch_size, self.buffer_size
+    dev, n = self.device, self.num_transitions
+    base = self._step if n == T else 0
+    if valid_starts is None:
+      valid_starts = self.valid_starts(L)
+    csum = valid_starts.cumsum(dim=1, dtype=torch.long)
     total = csum[:, -1]
     if not (total > 0).any():
       raise RuntimeError(f"no valid sequences L={L} n={n}")

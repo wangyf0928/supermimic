@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import tempfile
 import time
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import torch
+import torch.distributed as dist
 import tyro
 import wandb
 from tensordict import TensorDict
+from torch.utils.tensorboard import SummaryWriter
 
+from supermimic.distributed import is_main_process, world_size
 from supermimic.envs.t3_observations import T3History, T3Observations, raw_self_frame
 from supermimic.envs.world_model_env import WorldModelEnv
 from supermimic.envs.world_model_env_v2 import WorldModelEnvV2
@@ -345,8 +349,10 @@ class SuperMimicRunner:
 
     self._init_common()
     self._init_policy()
-    if self.cfg.resume is not None:
+    if self.cfg.resume is not None and is_main_process():
       load_training_checkpoint(self.cfg.resume, self._wm, self.policy_learner, device)
+    if world_size() > 1:
+      self._broadcast_weights()
 
     self.logger = Logger(
       run_name=cfg.run_name,
@@ -364,7 +370,7 @@ class SuperMimicRunner:
     self._num_goals = wm.num_goals
     self._num_actions = wm.num_actions
 
-    if self.cfg.wandb_run_path is not None:
+    if self.cfg.wandb_run_path is not None and is_main_process():
       load_wandb_checkpoint(self.cfg.wandb_run_path, wm, self.device)
 
     self.action_manager = self.env.unwrapped.action_manager
@@ -387,6 +393,15 @@ class SuperMimicRunner:
     self._sim_history: torch.Tensor | None = None
     self._t3_history: T3History | None = None
     self._t3_resets: torch.Tensor | None = None
+
+  def _broadcast_weights(self) -> None:
+    """Start all learners with the same parameters and checkpointed buffers."""
+    modules = [self._wm.dynamics, self._wm.sim_context, self.policy_learner.actor]
+    if isinstance(self.policy_learner, ActorCriticPolicyLearner):
+      modules.append(self.policy_learner.critic)
+    for module in modules:
+      for tensor in module.state_dict().values():
+        dist.broadcast(tensor, src=0)
 
   def _seed_sim_history(self) -> None:
     """Seed the real-sim obs-history ring with the noised current sensor."""
@@ -509,6 +524,8 @@ class SuperMimicRunner:
     wandb_config = {
       "env_cfg": asdict(self.env.cfg),
       "runner_cfg": asdict(self.cfg),
+      "world_size": world_size(),
+      "total_num_envs": self.env.num_envs * world_size(),
     }
 
     default_name = f"{self.task_id}-{log_dir.name}"
@@ -533,7 +550,8 @@ class SuperMimicRunner:
     env_close_fn = getattr(self.env, "close", None)
     if env_close_fn:
       env_close_fn()
-    wandb.finish()
+    if is_main_process():
+      wandb.finish()
 
   def _init_policy(self) -> None:
     actor = build_actor(self.cfg, self._wm, self.device)
@@ -712,9 +730,26 @@ class SuperMimicRunner:
       self.policy_learner.actor.update_normalization(actor_td)
 
   def run(self) -> None:
-    log_dir = self._create_log_dir()
-    self._init_wandb(log_dir)
+    log_dir = None
+    uploader = None
+    tensorboard_writer = None
+    with ExitStack() as cleanup:
+      cleanup.callback(self._cleanup)
+      if is_main_process():
+        log_dir = self._create_log_dir()
+        self._init_wandb(log_dir)
+        assert wandb.run is not None
+        uploader = CheckpointUploader(wandb.run)
+        cleanup.callback(uploader.finish)
+        tensorboard_writer = cleanup.enter_context(SummaryWriter(log_dir=str(log_dir)))
+      self._train(log_dir, uploader, tensorboard_writer)
 
+  def _train(
+    self,
+    log_dir: Path | None,
+    uploader: CheckpointUploader | None,
+    tensorboard_writer: SummaryWriter | None,
+  ) -> None:
     self.env.reset()
     if self._t3_obs is None:
       self._seed_sim_history()
@@ -737,18 +772,28 @@ class SuperMimicRunner:
     policy_learn_time = 0.0
     loss_dict: dict[str, torch.Tensor] = {}
     log_count = 0
-    assert wandb.run is not None  # _init_wandb ran before the loop
-    uploader = CheckpointUploader(wandb.run)
 
     for step in range(self.cfg.max_iterations):
       num_collected_steps += self.step()
 
-      for _ in range(should_train(step)):
-        if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
-          continue
+      repeats = should_train(step)
+      valid_starts = None
+      if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
+        repeats = 0
+      elif repeats and world_size() > 1:
+        # A small local rollout can end every episode before the WM horizon.
+        # All ranks must enter the same number of optimizer collectives.
+        valid_starts = self.replay_buffer.valid_starts(self.cfg.wm.horizon)
+        ready = valid_starts.any().int()
+        dist.all_reduce(ready, op=dist.ReduceOp.MIN)
+        if not ready.item():
+          repeats = 0
 
+      for _ in range(repeats):
         data = (
-          self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
+          self.replay_buffer.sample(
+            self.cfg.wm.horizon, self.cfg.wm.batch_size, valid_starts=valid_starts
+          )
           for _ in range(self.cfg.wm.num_batches)
         )
         starts = (
@@ -780,6 +825,7 @@ class SuperMimicRunner:
           policy_learn_time=policy_learn_time,
           loss_dict=loss_dict,
           num_collected_steps=num_collected_steps,
+          tensorboard_writer=tensorboard_writer,
         )
 
         log_count += 1
@@ -788,7 +834,8 @@ class SuperMimicRunner:
         policy_learn_time = 0
         num_collected_steps = 0
 
-      if step % self.cfg.save_interval == 0:
+      if log_dir is not None and step % self.cfg.save_interval == 0:
+        assert uploader is not None and wandb.run is not None
         world_model_path = str(log_dir / "world_model.pt")
         actor_path = str(log_dir / "actor.pt")
         torch.save(self._wm.bundle(), world_model_path)
@@ -817,6 +864,3 @@ class SuperMimicRunner:
             term_widths=self._representation.proprio_term_widths(self._num_actions),
           )
         uploader.submit(checkpoint_files, step)
-
-    uploader.finish()
-    self._cleanup()

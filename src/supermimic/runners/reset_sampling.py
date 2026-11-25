@@ -12,6 +12,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
+
+from supermimic.distributed import world_size
 
 
 @dataclass
@@ -137,8 +140,13 @@ class ReturnSampler:
     samples.scatter_add_(0, inverse, returns.reshape(-1))
     samples /= visits
     bins = keys % self.bin_count
-    new = torch.zeros_like(self.count).scatter_add_(0, bins, torch.ones_like(samples))
-    total = torch.zeros_like(self.value).scatter_add_(0, bins, samples)
+    stats = self.value.new_zeros((2, self.bin_count))
+    new, total = stats.unbind()
+    new.scatter_add_(0, bins, torch.ones_like(samples))
+    total.scatter_add_(0, bins, samples)
+    if world_size() > 1:
+      # Different ranks may visit a bin different numbers of times.
+      dist.all_reduce(stats)
     self.count = self.count.clamp(max=self.cfg.memory) + new
     self.value = torch.where(
       new > 0, self.value + (total - new * self.value) / self.count, self.value
