@@ -14,9 +14,11 @@ from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
+from supermimic.envs.t3_observations import T3Observations, raw_self_frame
 from supermimic.representations import extract_actor_goal
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
 from supermimic.runners.supermimic_runner import build_actor, build_world_model
+from supermimic.t3_model import T3Actor
 from supermimic.tasks.task_spec import build_actor_obs_td
 from supermimic.utils.wandb_artifacts import (
   download_artifact_cached,
@@ -87,13 +89,19 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       wm.dynamics.eval()
       representation = wm.representation
 
+      command = base_env.command_manager.get_term("motion")
       policy = None
+      t3_obs = None
+      t3_history = None
+      dones = None
       if cfg.use_policy:
         assert policy_state_dict is not None  # use_policy gated the load above
         policy = build_actor(runner_cfg, wm, device)
         policy.set_slot_mix({"motion": 1.0})
         policy.load_state_dict(policy_state_dict)
         policy.eval()
+        if isinstance(policy, T3Actor):
+          t3_obs = T3Observations(base_env, policy.cfg)
       else:
         actions = torch.rand((n_envs, wm.num_actions), device=device) * 2 - 1
 
@@ -107,22 +115,36 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       for _ in range(cfg.steps):
         with torch.inference_mode():
           if policy is not None:
-            # Resets resample physics, including those inside env.step().
-            sim_ctx = wm.sim_context.read(env.unwrapped)
-            rep_state = representation.represent(obs["full_state"])
-            sensor = representation.compute_actor_sensor(
-              rep_state,
-              sim_ctx,
-              sim_actor_obs=obs["actor"] if runner_cfg.actor_obs == "proprio" else None,
-            )
-            # Only the shape matters for timing; pad like training does at reset.
-            history = sensor.unsqueeze(1).repeat(1, runner_cfg.history_length, 1)
-            actor_obs = build_actor_obs_td(
-              {"motion": extract_actor_goal(obs["goal"])}, history
-            )
+            if t3_obs is not None:
+              root_quat = representation.extract_aux_state(obs["full_state"])[:, 3:7]
+              t3_history = t3_obs.advance(
+                t3_history,
+                raw_self_frame(obs["actor"], root_quat),
+                command.time_steps,
+                dones,
+              )
+              actor_obs = t3_obs.observe(
+                t3_history, root_quat, command.time_steps, noisy=False
+              )
+            else:
+              # Resets resample physics, including those inside env.step().
+              sim_ctx = wm.sim_context.read(env.unwrapped)
+              rep_state = representation.represent(obs["full_state"])
+              sensor = representation.compute_actor_sensor(
+                rep_state,
+                sim_ctx,
+                sim_actor_obs=obs["actor"]
+                if runner_cfg.actor_obs == "proprio"
+                else None,
+              )
+              # Only the shape matters for timing; pad like training does at reset.
+              history = sensor.unsqueeze(1).repeat(1, runner_cfg.history_length, 1)
+              actor_obs = build_actor_obs_td(
+                {"motion": extract_actor_goal(obs["goal"])}, history
+              )
             actions = policy(actor_obs)
 
-          obs, _, _, _ = env.step(actions)
+          obs, _, dones, _ = env.step(actions)
 
       if "cuda" in device:
         torch.cuda.synchronize()

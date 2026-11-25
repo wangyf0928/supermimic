@@ -81,9 +81,9 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   run = wandb.Api().run(cfg.wandb_path)
   runner_cfg = load_runner_cfg(run.config)
   check_representation_matches(task_id, runner_cfg.representation)
+  obs_mode = "T3 omni" if runner_cfg.version == "v2" else runner_cfg.actor_obs
   print(
-    f"[INFO] Observation noise: real-sim policy ON ({runner_cfg.actor_obs}), "
-    "WM viewer policy OFF"
+    f"[INFO] Observation noise: real-sim policy ON ({obs_mode}), WM viewer policy OFF"
   )
 
   motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]

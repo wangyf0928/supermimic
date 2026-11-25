@@ -12,7 +12,9 @@ import mujoco
 import numpy as np
 import torch
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
+from tensordict import TensorDict
 
+from supermimic.envs.t3_observations import T3Observations, append_frame, raw_self_frame
 from supermimic.models import Dynamics
 from supermimic.representations import (
   MaxCoordRepresentation,
@@ -20,6 +22,7 @@ from supermimic.representations import (
   extract_actor_goal,
 )
 from supermimic.sim_context import SimContext
+from supermimic.t3_model import T3Actor
 from supermimic.tasks.task_spec import (
   ContinuousGoalSpec,
   DiscreteGoalSpec,
@@ -59,7 +62,10 @@ class SuperMimicViewerMixin:
       for name, ts in self.task_specs.items()
       if ts.raw_goal_dim > 0
     }
-    motion = self.env.unwrapped.command_manager.get_term("motion").motion
+    motion_command = self.env.unwrapped.command_manager.get_term("motion")
+    if isinstance(self.policy, T3Actor):
+      self._t3_obs = T3Observations(self.env.unwrapped, self.policy.cfg)
+    motion = motion_command.motion
     self._replay_goal_tables: dict[str, torch.Tensor] = {
       name: ts.precompute_replay_goal(motion).to(device)
       for name, ts in self.task_specs.items()
@@ -115,16 +121,9 @@ class SuperMimicViewerMixin:
   def _advance_history(
     self, history: torch.Tensor | None, sensor: torch.Tensor
   ) -> torch.Tensor:
-    """Roll the policy's obs-history window forward by one frame and return it.
-    A fresh window (``history is None``) repeats the current frame, matching the
-    training reset padding; ``history_length == 1`` is just that single frame."""
-    history_length = self.policy.history_length
-    if history_length == 1:
-      return sensor.unsqueeze(1)
-    if history is None:
-      return sensor.unsqueeze(1).repeat(1, history_length, 1)
-    advanced = torch.cat([history[:, 1:], sensor.unsqueeze(1)], dim=1)
-    return torch.where(self._episode_starts[:, None, None], sensor[:, None], advanced)
+    return append_frame(
+      history, sensor, self.policy.history_length, self._episode_starts
+    )
 
   def _play_actor_sensor(self, rep_state: torch.Tensor, **kwargs) -> torch.Tensor:
     """Apply noise once to the real-sim policy observation, before history."""
@@ -156,6 +155,67 @@ class SuperMimicViewerMixin:
     else:
       raw = self._raw_goal_state[self.current_task].expand(aux_state.shape[0], -1)
     return ts.build_inference_goal_obs(raw)
+
+  def _policy_actions(
+    self, obs: TensorDict, gt_aux: torch.Tensor, gt_rep_state: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate the real robot and its closed-loop world-model prediction."""
+    proprio = self.representation.actor_obs_mode == "proprio"
+    wm_sensor = self.representation.compute_actor_sensor(
+      self.curr_pred_rep_state,
+      self.sim_ctx,
+      aux_state=self.curr_wm_aux,
+      joint_state=(
+        self.representation.joint_state(self.curr_pred_rep_state) if proprio else None
+      ),
+      last_action=self.last_actions,
+      noisy=False,
+    )
+    command = self.env.unwrapped.command_manager.get_term("motion")
+    if isinstance(self.policy, T3Actor):
+      gt_quat, wm_quat = gt_aux[:, 3:7], self.curr_wm_aux[:, 3:7]
+      self._gt_history = self._t3_obs.advance(
+        self._gt_history,
+        raw_self_frame(obs["actor"], gt_quat),
+        command.time_steps,
+        self._episode_starts,
+      )
+      # Both robots follow the same reference clock. Their self histories
+      # diverge during a rollout and are expressed in each robot's current yaw.
+      self._clean_gt_history = self._gt_history.self_frames
+      self._wm_history = self._advance_history(
+        self._wm_history, raw_self_frame(wm_sensor, wm_quat)
+      )
+      gt_obs = self._t3_obs.observe(
+        self._gt_history, gt_quat, command.time_steps, noisy=True
+      )
+      wm_obs = self._t3_obs.observe(
+        self._gt_history._replace(self_frames=self._wm_history),
+        wm_quat,
+        command.time_steps,
+        noisy=False,
+      )
+      return self.policy(gt_obs), self.policy(wm_obs)
+
+    gt_goal = self._build_actor_goal(obs["goal"], gt_aux)
+    sensor = self._play_actor_sensor(
+      gt_rep_state, sim_actor_obs=obs["actor"] if proprio else None
+    )
+    self._gt_history = self._advance_history(self._gt_history, sensor)
+    if self.policy.history_length > 1:
+      clean_sensor = obs["actor"] if proprio else gt_rep_state
+      self._clean_gt_history = self._advance_history(
+        self._clean_gt_history, clean_sensor
+      )
+    gt_obs = build_actor_obs_td({self.current_task: gt_goal}, self._gt_history)
+
+    wm_goal, _ = self.representation.compute_wm_goal(
+      command.motion, command.time_steps, self.curr_wm_aux
+    )
+    wm_actor_goal = self._build_actor_goal(wm_goal, self.curr_wm_aux)
+    self._wm_history = self._advance_history(self._wm_history, wm_sensor)
+    wm_obs = build_actor_obs_td({self.current_task: wm_actor_goal}, self._wm_history)
+    return self.policy(gt_obs), self.policy(wm_obs)
 
   def setup_wm_visualizer(
     self, wm_vis_model: mujoco.MjModel, *, update_every_n_frames: int | None = None
@@ -245,7 +305,7 @@ class SuperMimicViewerMixin:
     try:
       with torch.no_grad():
         obs = self.env.get_observations()
-        curr_gt_states, curr_goals = obs["full_state"], obs["goal"]
+        curr_gt_states = obs["full_state"]
 
         gt_aux = self.representation.extract_aux_state(curr_gt_states)
         gt_rep_state = self.representation.represent(curr_gt_states)
@@ -275,51 +335,7 @@ class SuperMimicViewerMixin:
                 restart[:, None, None], self._clean_gt_history, self._wm_history
               )
 
-        # Actor step on ground-truth obs.
-        actor_goal = self._build_actor_goal(curr_goals, gt_aux)
-        proprio = self.representation.actor_obs_mode == "proprio"
-        sensor = self._play_actor_sensor(
-          gt_rep_state,
-          sim_actor_obs=obs["actor"] if proprio else None,
-        )
-        self._gt_history = self._advance_history(self._gt_history, sensor)
-        if self.policy.history_length > 1:
-          clean_sensor = obs["actor"] if proprio else gt_rep_state
-          self._clean_gt_history = self._advance_history(
-            self._clean_gt_history, clean_sensor
-          )
-        actor_obs = build_actor_obs_td(
-          {self.current_task: actor_goal}, self._gt_history
-        )
-        actions = self.policy(actor_obs)
-
-        # Predict Next State (WM)
-        motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-        wm_goal, _ = self.representation.compute_wm_goal(
-          motion_cmd.motion,
-          motion_cmd.time_steps,
-          self.curr_wm_aux,
-        )
-
-        # Closed-loop actor step on the WM-predicted state.
-        wm_actor_goal = self._build_actor_goal(wm_goal, self.curr_wm_aux)
-        wm_sensor = self.representation.compute_actor_sensor(
-          self.curr_pred_rep_state,
-          self.sim_ctx,
-          aux_state=self.curr_wm_aux,
-          joint_state=(
-            self.representation.joint_state(self.curr_pred_rep_state)
-            if proprio
-            else None
-          ),
-          last_action=self.last_actions,
-          noisy=False,
-        )
-        self._wm_history = self._advance_history(self._wm_history, wm_sensor)
-        wm_actor_obs = build_actor_obs_td(
-          {self.current_task: wm_actor_goal}, self._wm_history
-        )
-        wm_actions = self.policy(wm_actor_obs)
+        actions, wm_actions = self._policy_actions(obs, gt_aux, gt_rep_state)
 
         # Both actors consume this frame's goal before the real step advances it.
         _, _, dones, _ = self.env.step(actions)

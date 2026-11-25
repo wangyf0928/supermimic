@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import os
+from pathlib import Path
 from typing import cast
 
 import torch
@@ -30,6 +31,7 @@ from mjlab.tasks.tracking.mdp import MotionCommand
 
 from supermimic.models import MultiEncoderAE
 from supermimic.representations import term_major_to_temporal
+from supermimic.t3_model import T3Policy
 
 
 def _export_onnx(
@@ -67,6 +69,26 @@ def _export_module(
   onnx_path = os.path.join(path, filename)
   _export_onnx(module, sample_inputs, input_names, output_names, onnx_path)
   return onnx_path
+
+
+def export_t3_policy_as_onnx(policy: T3Policy, path: str | Path) -> str:
+  """Export (self_obs, task_obs) → actions using formed, oldest-first windows.
+
+  Both inputs are frame-major tensors of shape (1, frames, features).
+  The task window includes its configured future reference frames.
+  """
+  path = Path(path)
+  return _export_module(
+    policy,
+    (
+      torch.zeros(1, policy.cfg.self_length, policy.self_dim),
+      torch.zeros(1, policy.cfg.task_length, policy.task_dim),
+    ),
+    ["self_obs", "task_obs"],
+    ["actions"],
+    str(path.parent),
+    path.name,
+  )
 
 
 class _SingleEncoderOnnx(nn.Module):

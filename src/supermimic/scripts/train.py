@@ -6,6 +6,7 @@ import faulthandler
 from dataclasses import dataclass
 
 import mjlab.tasks  # noqa: F401
+import torch
 import tyro
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg
@@ -56,6 +57,11 @@ def main() -> None:
     default=TrainConfig.from_task(chosen_task),
     config=mjlab.TYRO_FLAGS,
   )
+
+  if args.runner.version == "v2":
+    # Triton fails to compile the fused kinematics kernels in v2 reset and step.
+    torch.compiler.set_stance("force_eager")
+    print("[INFO] v2 training: torch.compile disabled")
 
   device = setup_device(args.device)
   print(f"[INFO] Loading environment: {chosen_task}")

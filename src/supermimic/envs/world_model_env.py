@@ -76,9 +76,7 @@ class WorldModelEnv:
     self.sim_ctx = batch["sim_ctx"]
     self.motion_times = batch["motion_time"]
     self._update_goal()
-    self._latest_sensor = self._synth_sensor()
-    if self.history_length > 1:
-      self._past_sensors = self._warmstart_past_sensors(batch)
+    self._reset_history(batch)
     return self.get_observations()
 
   def step(
@@ -102,16 +100,22 @@ class WorldModelEnv:
     self.last_actions = actions
 
     self._compute_commands()
+    self._advance_history()
+    return self.get_observations(), rewards, term_prob
 
+  def _reset_history(self, batch: TensorDict) -> None:
+    self._latest_sensor = self._synth_sensor()
+    if self.history_length > 1:
+      self._past_sensors = self._warmstart_past_sensors(batch)
+
+  def _advance_history(self) -> None:
     if self.history_length > 1:
       self._past_sensors = torch.cat(
         [self._past_sensors[:, 1:], self._latest_sensor.unsqueeze(1)], dim=1
       )
     self._latest_sensor = self._synth_sensor()
 
-    return self.get_observations(), rewards, term_prob
-
-  def _synth_sensor(self) -> torch.Tensor:
+  def _synth_sensor(self, noisy: bool = True) -> torch.Tensor:
     """Synthesize the actor's sensor from the current WM state."""
     return self.representation.compute_actor_sensor(
       self.rep_state,
@@ -119,15 +123,20 @@ class WorldModelEnv:
       aux_state=self.aux_state,
       joint_state=self.joint_state,
       last_action=self.last_actions,
-      noisy=True,
+      noisy=noisy,
     )
 
   def get_observations(self) -> TensorDict:
     history = self._latest_sensor.unsqueeze(1)
     if self.history_length > 1:
       history = torch.cat([self._past_sensors, history], dim=1)
-    critic = torch.cat([self.rep_state, self._wm_goal_obs, self.sim_ctx], dim=-1)
-    return build_actor_obs_td(self._task_goal_obs, history, critic)
+    return build_actor_obs_td(self._task_goal_obs, history, self._critic_obs())
+
+  def _critic_obs(self) -> torch.Tensor:
+    return torch.cat([self.rep_state, self._wm_goal_obs, self.sim_ctx], dim=-1)
+
+  def sample_start(self, buffer: ReplayBuffer, batch_size: int) -> TensorDict:
+    return sample_start(buffer, self.history_length, batch_size)
 
   def _compute_term_prob(
     self,

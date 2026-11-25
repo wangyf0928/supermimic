@@ -12,7 +12,9 @@ import tyro
 import wandb
 from tensordict import TensorDict
 
-from supermimic.envs.world_model_env import WorldModelEnv, sample_start
+from supermimic.envs.t3_observations import T3History, T3Observations, raw_self_frame
+from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.envs.world_model_env_v2 import WorldModelEnvV2
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
@@ -23,12 +25,14 @@ from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerC
 from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
-from supermimic.runners.exporter import export_actor_as_onnx
+from supermimic.runners.exporter import export_actor_as_onnx, export_t3_policy_as_onnx
 from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
 from supermimic.sim_context import SimContext
+from supermimic.t3_model import T3Actor, T3ModelCfg
 from supermimic.tasks.task_spec import (
   TasksCfg,
   build_actor_obs_td,
+  make_motion_task,
   resolve_task_specs,
 )
 from supermimic.utils.helpers import (
@@ -49,6 +53,9 @@ ActorCriticCfg = Annotated[
 
 @dataclass
 class SuperMimicRunnerCfg:
+  version: Literal["v1", "v2"] = field(default="v1", kw_only=True)
+  """Select the original multi-encoder policy or the T3 history policy."""
+  t3: T3ModelCfg = field(default_factory=T3ModelCfg, kw_only=True)
   wandb_project: str = "supermimic"
   run_name: str | None = None
   wandb_run_path: str | None = None
@@ -90,6 +97,10 @@ class SuperMimicRunnerCfg:
   return_sampler: ReturnSamplerCfg = field(default_factory=ReturnSamplerCfg)
 
   def __post_init__(self) -> None:
+    if self.version == "v2" and self.buffer_size < max(
+      self.t3.self_length, self.t3.task_length - self.t3.next_length
+    ):
+      raise ValueError("v2 replay buffer must fit the longest observation history")
     if self.resume is not None and self.wandb_run_path is not None:
       raise ValueError(
         "Use either --runner.resume (all network weights) or "
@@ -151,7 +162,8 @@ def build_world_model(
 
   Resets ``env`` to read its observation dimensions.
   """
-  if cfg.history_length > 1 and cfg.actor_obs != "proprio":
+  actor_obs_mode = "proprio" if cfg.version == "v2" else cfg.actor_obs
+  if cfg.history_length > 1 and actor_obs_mode != "proprio":
     raise RuntimeError(
       "history_length > 1 requires actor_obs='proprio' (--runner.actor-obs proprio)"
     )
@@ -176,7 +188,7 @@ def build_world_model(
     env.unwrapped.step_dt,
     env.unwrapped.cfg.decimation,
     default_joint_pos,
-    actor_obs_mode=cfg.actor_obs,
+    actor_obs_mode=actor_obs_mode,
   ).to(device)
 
   representation.bind(env.unwrapped, sim_context)
@@ -208,9 +220,19 @@ def build_world_model(
 
 def build_actor(
   cfg: SuperMimicRunnerCfg, wm: WorldModel, device: str
-) -> MultiEncoderAE:
+) -> MultiEncoderAE | T3Actor:
   """Actor sized by ``cfg``; the resolved task specs live on ``actor.task_specs``."""
   representation = wm.representation
+  if cfg.version == "v2":
+    return T3Actor(
+      self_dim=representation.proprio_obs_dim(wm.num_actions) + 3,
+      task_dim=T3Observations.task_dim,
+      action_dim=wm.num_actions,
+      dt=representation.dt,
+      cfg=cfg.t3,
+      task_specs=[make_motion_task(representation, wm.num_goals)],
+      slot_mix=cfg.slot_mix,
+    ).to(device)
   obs_dim = (
     representation.rep_state_dim
     if cfg.actor_obs == "rep_state"
@@ -305,6 +327,7 @@ class SuperMimicRunner:
   """
 
   cfg: SuperMimicRunnerCfg
+  _t3_obs: T3Observations | None = None
 
   def __init__(
     self,
@@ -347,6 +370,8 @@ class SuperMimicRunner:
     self.action_manager = self.env.unwrapped.action_manager
     self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     self.motion = self.motion_cmd.motion
+    if self.cfg.version == "v2":
+      self._t3_obs = T3Observations(self.env.unwrapped, self.cfg.t3)
 
     self.replay_buffer = ReplayBuffer(
       schema=self._buffer_schema(),
@@ -360,6 +385,8 @@ class SuperMimicRunner:
 
     self._pending_norm_updates: list[tuple] = []
     self._sim_history: torch.Tensor | None = None
+    self._t3_history: T3History | None = None
+    self._t3_resets: torch.Tensor | None = None
 
   def _seed_sim_history(self) -> None:
     """Seed the real-sim obs-history ring with the noised current sensor."""
@@ -393,8 +420,8 @@ class SuperMimicRunner:
   def _stores_actor_obs(self) -> bool:
     """The buffer carries the real sensor only for its sole reader, the
     history warm-start (``sample_start``)."""
-    return (
-      self._representation.actor_obs_mode == "proprio" and self.cfg.history_length > 1
+    return self._representation.actor_obs_mode == "proprio" and (
+      self.cfg.history_length > 1 or self._t3_obs is not None
     )
 
   def _buffer_schema(self) -> dict[str, FieldSpec]:
@@ -448,8 +475,10 @@ class SuperMimicRunner:
     }
     self.replay_buffer.insert(TensorDict(fields, batch_size=[self.env.num_envs]))
 
+    # T3 applies fixed channel scales. Its full windows need no running statistics.
+    actor_input = actor_td.detach().clone() if self._t3_obs is None else None
     self._pending_norm_updates.append(
-      (curr_states.clone(), raw_actions.clone(), actor_td.detach().clone())
+      (curr_states.clone(), raw_actions.clone(), actor_input)
     )
     return next_obs, rewards, dones, extras
 
@@ -459,7 +488,8 @@ class SuperMimicRunner:
       return
     states, actions, actor_inputs = zip(*self._pending_norm_updates, strict=True)
     self.world_model_learner.update_normalization(torch.cat(states), torch.cat(actions))
-    self._update_actor_normalization(actor_inputs)
+    if self._t3_obs is None:
+      self._update_actor_normalization(actor_inputs)
     self._pending_norm_updates.clear()
 
   def _create_log_dir(self) -> Path:
@@ -511,11 +541,17 @@ class SuperMimicRunner:
       ts for ts in actor.task_specs if self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
     ]
 
-    print("[INFO] Sim slot ranges:")
-    for ts, (lo, hi) in zip(
-      actor.task_specs, actor.slot_ranges(self.env.num_envs), strict=True
-    ):
-      print(f"  {ts.name}: [{lo}, {hi}) — goal_dim={ts.goal_dim}")
+    if isinstance(actor, T3Actor):
+      print(
+        f"[INFO] T3 motion actor: {actor.cfg.self_length} self frames, "
+        f"{actor.cfg.task_length} reference frames ({actor.cfg.next_length} future)"
+      )
+    else:
+      print("[INFO] Sim slot ranges:")
+      for ts, (lo, hi) in zip(
+        actor.task_specs, actor.slot_ranges(self.env.num_envs), strict=True
+      ):
+        print(f"  {ts.name}: [{lo}, {hi}) — goal_dim={ts.goal_dim}")
     critic_input_dim = (
       self._representation.rep_state_dim
       + self._num_goals
@@ -529,20 +565,25 @@ class SuperMimicRunner:
 
     policy_cfg = self.cfg.policy
 
-    self.wm_env = WorldModelEnv(
+    env_kwargs = dict(
       dynamics=self._dynamics,
       representation=self._representation,
       env=self.env,
       task_specs=self._active_task_specs,
-      history_length=self.cfg.history_length,
+      history_length=actor.history_length,
       termination_softness=self.cfg.termination_softness,
+    )
+    self.wm_env = (
+      WorldModelEnv(**env_kwargs)
+      if self._t3_obs is None
+      else WorldModelEnvV2(**env_kwargs, observations=self._t3_obs)
     )
     if torch.cuda.is_available():
       # Bound FK kernel size to avoid Triton compilation failures.
       self.wm_env.step = torch.compile(
         self.wm_env.step, options={"max_fusion_size": 16}
       )
-      self.wm_env.reset = torch.compile(self.wm_env.reset)
+      # self.wm_env.reset = torch.compile(self.wm_env.reset)
 
     self._configure_reset_sampling()
 
@@ -563,6 +604,15 @@ class SuperMimicRunner:
     motion_times: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> TensorDict:
+    if self._t3_obs is not None:
+      root = aux_state[:, 3:7]
+      self._t3_history = self._t3_obs.advance(
+        self._t3_history,
+        raw_self_frame(sim_actor_obs, root),
+        motion_times,
+        self._t3_resets,
+      )
+      return self._t3_obs.observe(self._t3_history, root, motion_times, noisy=True)
     proprio = self.cfg.actor_obs == "proprio"
     sensor = self._representation.compute_actor_sensor(
       rep_state,
@@ -631,7 +681,10 @@ class SuperMimicRunner:
         actor_td=actor_td,
         extra_fields=extra_fields,
       )
-      self._advance_sim_history(next_obs["actor"].to(self.device), dones)
+      if self._t3_obs is None:
+        self._advance_sim_history(next_obs["actor"].to(self.device), dones)
+      else:
+        self._t3_resets = dones.bool()
       terminated = self.env.unwrapped.termination_manager.terminated
       self.logger.process_env_step(rewards, terminated, extras)
 
@@ -663,7 +716,10 @@ class SuperMimicRunner:
     self._init_wandb(log_dir)
 
     self.env.reset()
-    self._seed_sim_history()
+    if self._t3_obs is None:
+      self._seed_sim_history()
+    else:
+      self._t3_history = self._t3_resets = None
 
     print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
 
@@ -696,9 +752,7 @@ class SuperMimicRunner:
           for _ in range(self.cfg.wm.num_batches)
         )
         starts = (
-          sample_start(
-            self.replay_buffer, self.cfg.history_length, self.cfg.policy.batch_size
-          )
+          self.wm_env.sample_start(self.replay_buffer, self.cfg.policy.batch_size)
           for _ in range(self.cfg.policy.num_batches)
         )
 
@@ -746,7 +800,12 @@ class SuperMimicRunner:
           torch.save(critic.state_dict(), critic_path)
           checkpoint_files.append(critic_path)
         # Skip ONNX export on huge datasets.
-        if (
+        actor = self.policy_learner.actor
+        if isinstance(actor, T3Actor):
+          checkpoint_files.append(
+            export_t3_policy_as_onnx(actor.network, log_dir / "policy_motion.onnx")
+          )
+        elif (
           self._representation.actor_obs_mode == "proprio"
           and self.motion.time_step_total <= 15_000
         ):
