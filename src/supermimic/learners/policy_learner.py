@@ -22,7 +22,7 @@ from supermimic.learners.learner_utils import (
 class BpttPolicyLearnerCfg:
   lr: float = 2e-4
   num_batches: int = 1
-  batch_size: int = 512
+  batch_size: int = 1024
   horizon: int = 32
   gamma: float = 1.0
   survival_masking: bool = True
