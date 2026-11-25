@@ -76,9 +76,9 @@ class WorldModelEnv:
     self.sim_ctx = batch["sim_ctx"]
     self.motion_times = batch["motion_time"]
     self._update_goal()
+    self._latest_sensor = self._synth_sensor()
     if self.history_length > 1:
       self._past_sensors = self._warmstart_past_sensors(batch)
-    self._latest_sensor = self._synth_sensor()
     return self.get_observations()
 
   def step(
@@ -180,6 +180,8 @@ class WorldModelEnv:
     pad = batch["pad_mask"][:, :-1]  # padding is a leading run (sample_causal)
     first_real = (~pad).int().argmax(dim=1)
     shared = noisy[torch.arange(len(noisy), device=noisy.device), first_real]
+    # With no real predecessor, every slot repeats the current noised sensor.
+    shared = torch.where(pad[:, -1:], self._latest_sensor, shared)
     return torch.where(pad.unsqueeze(-1), shared.unsqueeze(1), noisy)
 
 

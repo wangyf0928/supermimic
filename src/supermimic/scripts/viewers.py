@@ -81,10 +81,7 @@ class SuperMimicViewerMixin:
       adr = mj_model.joint(free_joint_id).qposadr[0]
       self.free_joint_q_adr = np.arange(adr, adr + 7)
 
-    self.step_in_rollout = 0
-    self.curr_pred_rep_state = None
-    self.curr_wm_aux = None
-    self.last_actions: torch.Tensor | None = None
+    self.reset_env_supermimic()
 
     # For per-body tracking: map entity-local body indexes to MuJoCo body IDs
     if isinstance(self.representation, MaxCoordRepresentation):
@@ -95,9 +92,13 @@ class SuperMimicViewerMixin:
 
   def reset_env_supermimic(self) -> None:
     self.step_in_rollout = 0
+    self._episode_starts = None
     self.curr_pred_rep_state = None
     self.curr_wm_aux = None
     self.last_actions = None
+    self._gt_history = None
+    self._clean_gt_history = None
+    self._wm_history = None
 
   def set_task(self, name: str) -> None:
     """Switch the active task. Reroutes the actor through that task's encoder."""
@@ -122,7 +123,8 @@ class SuperMimicViewerMixin:
       return sensor.unsqueeze(1)
     if history is None:
       return sensor.unsqueeze(1).repeat(1, history_length, 1)
-    return torch.cat([history[:, 1:], sensor.unsqueeze(1)], dim=1)
+    advanced = torch.cat([history[:, 1:], sensor.unsqueeze(1)], dim=1)
+    return torch.where(self._episode_starts[:, None, None], sensor[:, None], advanced)
 
   def _play_actor_sensor(self, rep_state: torch.Tensor, **kwargs) -> torch.Tensor:
     """Apply noise once to the real-sim policy observation, before history."""
@@ -148,13 +150,9 @@ class SuperMimicViewerMixin:
     ts = self.task_specs[self.current_task]
     if self._replay_mode.get(self.current_task, False):
       motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-      t = (
-        motion_cmd.time_steps[0]
-        .long()
-        .clamp(max=self._replay_goal_tables[self.current_task].shape[0] - 1)
-      )
-      raw = self._replay_goal_tables[self.current_task][t : t + 1]
-      raw = raw.expand(aux_state.shape[0], -1)
+      table = self._replay_goal_tables[self.current_task]
+      t = motion_cmd.time_steps.long().clamp(max=table.shape[0] - 1)
+      raw = table[t]
     else:
       raw = self._raw_goal_state[self.current_task].expand(aux_state.shape[0], -1)
     return ts.build_inference_goal_obs(raw)
@@ -186,28 +184,46 @@ class SuperMimicViewerMixin:
         update_every_n_frames is not None and self._counter % update_every_n_frames != 0
       ):
         return
-      if isinstance(self.representation, MaxCoordRepresentation):
+      if self.wm_vis_xpos is None and self.wm_vis_qpos is None:
+        return
+      origins = base_env.scene.env_origins.cpu().numpy()
+      episode_starts = self._episode_starts.cpu().numpy()
+      for i in viz.get_env_indices(len(origins)):
+        if episode_starts[i]:
+          continue
+        label = f"wm_prediction_{i}"
         if self.wm_vis_xpos is not None:
           viz.add_ghost_bodies(
             model=self.wm_vis_model,
             body_ids=self.mj_body_ids,
-            body_xpos=self.wm_vis_xpos,
-            body_xquat=self.wm_vis_xquat,
-            label="wm_prediction",
+            body_xpos=self.wm_vis_xpos[i] + origins[i],
+            body_xquat=self.wm_vis_xquat[i],
+            label=label,
           )
-      else:
-        if self.wm_vis_qpos is not None:
+        else:
+          qpos = self.wm_vis_qpos[i].copy()
+          mocap_pos = mocap_quat = None
+          if self.free_joint_q_adr is not None:
+            qpos[self.free_joint_q_adr[:3]] += origins[i]
+          else:
+            mocap_pos = self.wm_vis_mocap_pos[i] + origins[i]
+            mocap_quat = self.wm_vis_mocap_quat[i]
           viz.add_ghost_entity(
-            self.wm_vis_qpos,
+            qpos,
             model=self.wm_vis_model,
-            mocap_pos=self.wm_vis_mocap_pos,
-            mocap_quat=self.wm_vis_mocap_quat,
-            label="wm_prediction",
+            mocap_pos=mocap_pos,
+            mocap_quat=mocap_quat,
+            label=label,
           )
 
     base_env.update_visualizers = combined_vis_callback
 
-  def reset_wm_visualizer(self) -> None:
+  def reset_wm_visualizer(self, env_ids: torch.Tensor | None = None) -> None:
+    if env_ids is not None:
+      if self.curr_wm_aux is not None:
+        self.step_in_rollout[env_ids] = 0
+        self._episode_starts[env_ids] = True
+      return
     self.reset_env_supermimic()
     self.wm_vis_qpos = None
     self.wm_vis_mocap_pos = None
@@ -231,47 +247,57 @@ class SuperMimicViewerMixin:
         obs = self.env.get_observations()
         curr_gt_states, curr_goals = obs["full_state"], obs["goal"]
 
-        # Pre-step motion frame for the WM goal; env.step advances time_steps below.
-        motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-        wm_motion_times = motion_cmd.time_steps.clone()
-
-        # Initialize wm state at start of rollout (or if reset)
-        if self.curr_wm_aux is None or self.step_in_rollout == 0:
-          self.curr_wm_aux = self.representation.extract_aux_state(curr_gt_states)
-          self.curr_pred_rep_state = self.representation.represent(curr_gt_states)
+        gt_aux = self.representation.extract_aux_state(curr_gt_states)
+        gt_rep_state = self.representation.represent(curr_gt_states)
+        gt_actions = obs["actor"][:, -self.dynamics.num_actions :]
+        if self.curr_wm_aux is None:
+          self.step_in_rollout = gt_aux.new_zeros(gt_aux.shape[0], dtype=torch.long)
+          self._episode_starts = torch.ones_like(self.step_in_rollout, dtype=torch.bool)
+          self.curr_wm_aux = gt_aux
+          self.curr_pred_rep_state = gt_rep_state
           self.sim_ctx = self.sim_context.read(self.env.unwrapped)
-          self._gt_history = None
-          self._wm_history = None
-
-        if self.last_actions is None:
-          self.last_actions = torch.zeros(
-            (1, self.dynamics.num_actions), device=curr_gt_states.device
-          )
+          self.last_actions = gt_actions.clone()
+        else:
+          restart = self.step_in_rollout == 0
+          if restart.any():
+            self.curr_wm_aux = torch.where(restart[:, None], gt_aux, self.curr_wm_aux)
+            self.curr_pred_rep_state = torch.where(
+              restart[:, None], gt_rep_state, self.curr_pred_rep_state
+            )
+            self.last_actions = torch.where(
+              restart[:, None], gt_actions, self.last_actions
+            )
+            self.sim_ctx = torch.where(
+              restart[:, None], self.sim_context.read(self.env.unwrapped), self.sim_ctx
+            )
+            if self._clean_gt_history is not None:
+              self._wm_history = torch.where(
+                restart[:, None, None], self._clean_gt_history, self._wm_history
+              )
 
         # Actor step on ground-truth obs.
-        gt_aux = self.representation.extract_aux_state(curr_gt_states)
         actor_goal = self._build_actor_goal(curr_goals, gt_aux)
-        gt_rep_state = self.representation.represent(curr_gt_states)
         proprio = self.representation.actor_obs_mode == "proprio"
         sensor = self._play_actor_sensor(
           gt_rep_state,
           sim_actor_obs=obs["actor"] if proprio else None,
         )
         self._gt_history = self._advance_history(self._gt_history, sensor)
+        if self.policy.history_length > 1:
+          clean_sensor = obs["actor"] if proprio else gt_rep_state
+          self._clean_gt_history = self._advance_history(
+            self._clean_gt_history, clean_sensor
+          )
         actor_obs = build_actor_obs_td(
           {self.current_task: actor_goal}, self._gt_history
         )
         actions = self.policy(actor_obs)
 
-        # Env Step (Ground Truth simulation)
-        _, _, dones, _ = self.env.step(actions)
-        self._step_count += 1
-        self._stats_steps += 1
-
         # Predict Next State (WM)
+        motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
         wm_goal, _ = self.representation.compute_wm_goal(
           motion_cmd.motion,
-          wm_motion_times,
+          motion_cmd.time_steps,
           self.curr_wm_aux,
         )
 
@@ -281,7 +307,11 @@ class SuperMimicViewerMixin:
           self.curr_pred_rep_state,
           self.sim_ctx,
           aux_state=self.curr_wm_aux,
-          joint_state=self.representation.joint_state(self.curr_pred_rep_state),
+          joint_state=(
+            self.representation.joint_state(self.curr_pred_rep_state)
+            if proprio
+            else None
+          ),
           last_action=self.last_actions,
           noisy=False,
         )
@@ -290,6 +320,11 @@ class SuperMimicViewerMixin:
           {self.current_task: wm_actor_goal}, self._wm_history
         )
         wm_actions = self.policy(wm_actor_obs)
+
+        # Both actors consume this frame's goal before the real step advances it.
+        _, _, dones, _ = self.env.step(actions)
+        self._step_count += 1
+        self._stats_steps += 1
 
         next_aux, next_rep_state = self.dynamics(
           self.curr_pred_rep_state, wm_actions, self.curr_wm_aux, self.sim_ctx
@@ -303,39 +338,40 @@ class SuperMimicViewerMixin:
         full_state = self.representation.reconstruct_full_state(
           self.curr_wm_aux, self.curr_pred_rep_state
         )
-        state = full_state[0]  # Take 0-th env
+        state = full_state.cpu().numpy()
+        num_envs = state.shape[0]
 
         if isinstance(self.representation, MaxCoordRepresentation):
           B = self.representation.num_bodies
-          self.wm_vis_xpos = state[: B * 3].reshape(B, 3).cpu().numpy()
-          self.wm_vis_xquat = state[B * 3 : B * 7].reshape(B, 4).cpu().numpy()
+          self.wm_vis_xpos = state[:, : B * 3].reshape(num_envs, B, 3)
+          self.wm_vis_xquat = state[:, B * 3 : B * 7].reshape(num_envs, B, 4)
         else:
           nq = self.env.unwrapped.sim.mj_model.nq
-          qpos = np.zeros(nq)
-          root_pos = state[:3]
-          root_quat = state[3:7]
+          qpos = np.zeros((num_envs, nq))
+          root_pos = state[:, :3]
+          root_quat = state[:, 3:7]
           if self.free_joint_q_adr is not None:
-            qpos[self.free_joint_q_adr[0:3]] = root_pos.cpu().numpy()
-            qpos[self.free_joint_q_adr[3:7]] = root_quat.cpu().numpy()
+            qpos[:, self.free_joint_q_adr[:3]] = root_pos
+            qpos[:, self.free_joint_q_adr[3:7]] = root_quat
             self.wm_vis_mocap_pos = None
             self.wm_vis_mocap_quat = None
             joint_state_start = 7
           else:
             # Fixed-base models may still need mocap pose for ghost visualization.
-            self.wm_vis_mocap_pos = root_pos.cpu().numpy()
-            self.wm_vis_mocap_quat = root_quat.cpu().numpy()
+            self.wm_vis_mocap_pos = root_pos
+            self.wm_vis_mocap_quat = root_quat
             joint_state_start = 0
           joint_state = state[
-            joint_state_start : joint_state_start + len(self.joint_q_adr)
+            :, joint_state_start : joint_state_start + len(self.joint_q_adr)
           ]
-          qpos[self.joint_q_adr] = joint_state.cpu().numpy()
+          qpos[:, self.joint_q_adr] = joint_state
           self.wm_vis_qpos = qpos
 
         self.step_in_rollout += 1
-        if dones.any() or self.step_in_rollout >= self.num_steps_rollout:
-          self.step_in_rollout = 0
-          self.curr_wm_aux = None
-          self.last_actions = None
+        self._episode_starts = dones.reshape(-1).bool().clone()
+        self.step_in_rollout.masked_fill_(
+          self._episode_starts | (self.step_in_rollout >= self.num_steps_rollout), 0
+        )
       return True
     except Exception as exc:
       self._last_error = f"{type(exc).__name__}: {exc}"
@@ -374,6 +410,8 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
 
 
 class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
+  _clip_indices: list[int] | None = None
+
   def __init__(
     self,
     env,
@@ -400,10 +438,13 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     self.setup_wm_visualizer(wm_vis_model, update_every_n_frames=2)
     self.motion_names = motion_names
     self._selected_clip_idx = 0
+    self._clip_dropdown = None
+    motion_cmd = env.unwrapped.command_manager.get_term("motion")
+    self._clip_indices = motion_cmd.clip_indices
 
   def setup(self) -> None:
     super().setup()
-    self._scene.camera_tracking_enabled = True
+    self._scene.camera_tracking_enabled = self.env.num_envs == 1
     self._setup_task_widgets()
     self._setup_motion_clip_widget()
 
@@ -461,28 +502,101 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
   def _setup_motion_clip_widget(self) -> None:
     if not self._supports_clip_selection():
       return
-    clip_dropdown = self._server.gui.add_dropdown(
-      "Motion Clip",
-      options=self.motion_names,
-      initial_value=self.motion_names[0],
+    options = self.motion_names
+    if len(set(options)) != len(options):
+      options = [f"{i + 1} · {name}" for i, name in enumerate(options)]
+    multi = len(self._clip_indices or ()) > 1
+    label = "Motion Clip"
+    idx = 0
+    if self._clip_indices:
+      env_idx = self._scene.env_idx
+      if multi:
+        label = f"Motion Clip (env {env_idx})"
+      idx = self._clip_indices[env_idx]
+    self._clip_dropdown = self._server.gui.add_dropdown(
+      label,
+      options=options,
+      initial_value=options[idx],
+      hint="Choose a robot using Scene → Environment → Select." if multi else None,
       order=0,
     )
 
-    @clip_dropdown.on_update
+    @self._clip_dropdown.on_update
     def _(event) -> None:
-      self._selected_clip_idx = self.motion_names.index(event.target.value)
-      self.request_reset()
+      if self._clip_indices:
+        # A server-side update reflects the selected robot's existing clip.
+        if event.client_id is None:
+          return
+        self.request_action(
+          "CUSTOM",
+          {
+            "type": "select_motion_clip",
+            "env_idx": self._scene.env_idx,
+            "clip_idx": options.index(event.target.value),
+          },
+        )
+      else:
+        self._selected_clip_idx = options.index(event.target.value)
+        self.request_reset()
+
+    shuffle_button = self._server.gui.add_button(
+      "Randomize All Motions",
+      hint="Start each robot on a randomly chosen different motion.",
+      disabled=len(options) < 2,
+      order=0.5,
+    )
+
+    @shuffle_button.on_click
+    def _(_) -> None:
+      self.request_action("CUSTOM", {"type": "randomize_motion_clips"})
+
+  def _sync_motion_clip_widget(self) -> None:
+    if self._clip_indices and self._clip_dropdown is not None:
+      env_idx = self._scene.env_idx
+      idx = self._clip_indices[env_idx]
+      if len(self._clip_indices) > 1:
+        self._clip_dropdown.label = f"Motion Clip (env {env_idx})"
+      self._clip_dropdown.value = self._clip_dropdown.options[idx]
+
+  def _update_env_dependent_plots(self) -> None:
+    if self._scene.env_idx != self._prev_env_idx:
+      self._sync_motion_clip_widget()
+    super()._update_env_dependent_plots()
+
+  def _handle_custom_action(self, action, payload) -> bool:
+    if isinstance(payload, dict) and payload.get("type") == "randomize_motion_clips":
+      motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+      if motion_cmd.randomize_clips():
+        self.reset_environment()
+        self._sync_motion_clip_widget()
+      return True
+    if isinstance(payload, dict) and payload.get("type") == "select_motion_clip":
+      assert self._clip_indices is not None
+      env_idx = payload["env_idx"]
+      env_ids = torch.tensor([env_idx], device=self.env.device)
+      with self._sim_lock:
+        self._clip_indices[env_idx] = payload["clip_idx"]
+        self.env.unwrapped.reset(env_ids=env_ids)
+        self.reset_wm_visualizer(env_ids)
+      self._sync_motion_clip_widget()
+      return True
+    return super()._handle_custom_action(action, payload)
 
   def reset_environment(self) -> None:
     super().reset_environment()
     self.reset_wm_visualizer()
-    if self._supports_clip_selection():
+    if not self._clip_indices and self._supports_clip_selection():
       with self._sim_lock:
         self._apply_selected_clip()
 
   def _handle_gui_reset(self, all_envs: bool) -> None:
     super()._handle_gui_reset(all_envs)
-    self.reset_wm_visualizer()
+    if self._clip_indices and not all_envs:
+      env_ids = torch.tensor([self._scene.env_idx], device=self.env.device)
+      self.reset_wm_visualizer(env_ids)
+    else:
+      self.reset_wm_visualizer()
+    self._sync_motion_clip_widget()
 
   def _supports_clip_selection(self) -> bool:
     return bool(self.motion_names)

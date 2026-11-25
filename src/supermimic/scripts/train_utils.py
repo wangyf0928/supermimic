@@ -1,6 +1,9 @@
-"""Shared utilities for training scripts."""
+"""Shared utilities for training and playback scripts."""
 
 from __future__ import annotations
+
+import glob
+import os
 
 import torch
 import wandb
@@ -9,6 +12,25 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.utils.torch import configure_torch_backends
 
 from supermimic.utils.wandb_artifacts import download_artifact_cached
+
+
+def resolve_motion_source(source: str) -> str | list[str]:
+  """Resolve local motion paths and comma-separated globs for MotionLoader."""
+  paths = [os.path.expanduser(part.strip()) for part in source.split(",")]
+  if len(paths) == 1 and "**" not in paths[0]:
+    # MotionLoader handles a single file, packed directory, or ordinary glob.
+    return paths[0]
+
+  files: list[str] = []
+  for path in paths:
+    if glob.has_magic(path):
+      matches = sorted(set(glob.glob(path, recursive=True)))
+      if not matches:
+        raise ValueError(f"No motion files matched: {path}")
+      files.extend(matches)
+    else:
+      files.append(path)
+  return files
 
 
 def download_registry_motions(registry_name: str | None) -> str | list[str] | None:

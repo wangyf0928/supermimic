@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import faulthandler
-import os
 from dataclasses import dataclass
 
 import mjlab.tasks  # noqa: F401
@@ -16,6 +15,7 @@ from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRun
 from supermimic.scripts.train_utils import (
   create_env,
   download_registry_motions,
+  resolve_motion_source,
   setup_device,
 )
 
@@ -61,13 +61,7 @@ def main() -> None:
   print(f"[INFO] Loading environment: {chosen_task}")
 
   if args.motion_file:
-    # Local motions handed straight to MotionLoader (globs/concatenates).
-    if "," in args.motion_file:
-      args.env.commands["motion"].motion_file = [
-        os.path.expanduser(p.strip()) for p in args.motion_file.split(",")
-      ]
-    else:
-      args.env.commands["motion"].motion_file = os.path.expanduser(args.motion_file)
+    args.env.commands["motion"].motion_file = resolve_motion_source(args.motion_file)
     args.registry_name = None  # avoid linking a stale registry artifact for lineage
     print(f"[INFO] Using local motion file: {args.motion_file}")
   else:

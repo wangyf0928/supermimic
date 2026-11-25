@@ -67,7 +67,14 @@ class WorldModelLearner:
       for name, attr in representation.LOSS_WEIGHT_CONFIG.items()
     }
 
-    self._compiled_rollout = torch.compile(self._rollout)
+    # On Ada, Triton can fail compiling the smaller reduction tile for the
+    # fused LayerNorm/GELU backward. Keep the original tiles for this rollout.
+    ada_cuda = torch.device(device).type == "cuda" and torch.cuda.get_device_capability(
+      device
+    ) == (8, 9)
+    self._compiled_rollout = torch.compile(
+      self._rollout, options={"dynamic_scale_rblock": False} if ada_cuda else None
+    )
     self._compiled_compute_losses = torch.compile(self._compute_losses)
     self._compiled_represent = torch.compile(self.representation.represent)
     self._captured_update = CapturedUpdate(

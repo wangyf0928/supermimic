@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import tempfile
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +36,7 @@ from supermimic.utils.helpers import (
   unpack_obs_dims,
 )
 from supermimic.utils.logger import Logger
-from supermimic.utils.wandb_artifacts import download_model_dir, log_model_artifact
+from supermimic.utils.wandb_artifacts import CheckpointUploader, download_model_dir
 
 if TYPE_CHECKING:
   from mjlab.rl import RslRlVecEnvWrapper
@@ -59,7 +59,7 @@ class SuperMimicRunnerCfg:
   headless: bool = True
   buffer_size: int = 1000
   representation: str = "gencoord"  # "gencoord" or "maxcoord"
-  actor_obs: str = "rep_state"  # "rep_state" or "proprio"
+  actor_obs: str = "proprio"  # "rep_state" or "proprio"
   log_interval: int = 10
   save_interval: int = 1000
   history_length: int = 1
@@ -466,7 +466,11 @@ class SuperMimicRunner:
     """Create and return a timestamped log directory."""
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir = Path("logs", self.task_id, timestamp)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+      log_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+      # Concurrent runs of the same task can start in the same second.
+      log_dir = Path(tempfile.mkdtemp(prefix=f"{timestamp}_", dir=log_dir.parent))
     print(f"[INFO] Logging to {log_dir}")
     return log_dir
 
@@ -565,7 +569,8 @@ class SuperMimicRunner:
       sim_ctx,
       aux_state=aux_state,
       sim_actor_obs=sim_actor_obs if proprio else None,
-      noisy=proprio,
+      # Longer histories already contain the noise sampled as each frame arrived.
+      noisy=proprio and self.cfg.history_length == 1,
     )
     goals = {
       ts.name: ts.extract_training_goal(self.motion, motion_times, aux_state)
@@ -676,8 +681,8 @@ class SuperMimicRunner:
     policy_learn_time = 0.0
     loss_dict: dict[str, torch.Tensor] = {}
     log_count = 0
-    uploader = ThreadPoolExecutor(max_workers=1)
-    upload: Future | None = None
+    assert wandb.run is not None  # _init_wandb ran before the loop
+    uploader = CheckpointUploader(wandb.run)
 
     for step in range(self.cfg.max_iterations):
       num_collected_steps += self.step()
@@ -730,10 +735,6 @@ class SuperMimicRunner:
         num_collected_steps = 0
 
       if step % self.cfg.save_interval == 0:
-        assert wandb.run is not None  # _init_wandb ran before the loop
-        # The previous version must be logged before its files are overwritten.
-        if upload is not None:
-          upload.result()
         world_model_path = str(log_dir / "world_model.pt")
         actor_path = str(log_dir / "actor.pt")
         torch.save(self._wm.bundle(), world_model_path)
@@ -756,7 +757,7 @@ class SuperMimicRunner:
             run_name=wandb.run.name,
             term_widths=self._representation.proprio_term_widths(self._num_actions),
           )
-        upload = uploader.submit(log_model_artifact, checkpoint_files)
+        uploader.submit(checkpoint_files, step)
 
-    uploader.shutdown()
+    uploader.finish()
     self._cleanup()

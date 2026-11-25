@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import glob
 import os
 from dataclasses import dataclass
+from math import ceil, isqrt
 from pathlib import Path
 from typing import Literal
 
@@ -20,6 +20,8 @@ from mjlab.utils.torch import configure_torch_backends
 import supermimic.tasks  # noqa: F401
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
 from supermimic.runners.supermimic_runner import build_actor, build_world_model
+from supermimic.scripts.playback_motion import PlaybackMotionCommandCfg
+from supermimic.scripts.train_utils import resolve_motion_source
 from supermimic.scripts.viewers import (
   SuperMimicNativeViewer,
   SuperMimicViserViewer,
@@ -38,17 +40,36 @@ class PlayConfig:
   initial_task: Literal["motion", "velocity"] = "motion"
   """Task selected when the viewer opens. Switch live via the GUI dropdown."""
   device: str | None = None
+  num_envs: int = 1
+  """Number of robots to play side by side, each with its own motion clip."""
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
+  checkpoint_dir: Path | None = None
+  """Load actor.pt and world_model.pt from this directory using the W&B run's config."""
 
 
 def play(task_id: str, cfg: PlayConfig) -> None:
+  if cfg.num_envs < 1:
+    raise ValueError("--num-envs must be at least 1")
+  model_dir = None
+  if cfg.checkpoint_dir is not None:
+    model_dir = cfg.checkpoint_dir.expanduser()
+    for filename in ("actor.pt", "world_model.pt"):
+      checkpoint = model_dir / filename
+      if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint}")
+    print(f"[INFO] Using local checkpoint: {model_dir}")
+
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
   print(f"[INFO] Loading environment: {task_id}")
   env_cfg = load_env_cfg(task_id, play=True)
-  env_cfg.scene.num_envs = 1
+  env_cfg.scene.num_envs = cfg.num_envs
+  if cfg.num_envs > 1:
+    # Frame the full grid when the web viewer opens.
+    rows = ceil(cfg.num_envs / isqrt(cfg.num_envs))
+    env_cfg.viewer.distance += (rows - 1) * env_cfg.scene.env_spacing
   env_cfg.sim.mujoco.iterations = 50
   env_cfg.sim.mujoco.ls_iterations = 50
   # The viewer noises the real-sim policy input exactly once, in either obs mode.
@@ -68,18 +89,11 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   command_term = env_cfg.commands["motion"]
   assert isinstance(command_term, MotionCommandCfg)
+  command_term = PlaybackMotionCommandCfg(**vars(command_term))
+  env_cfg.commands["motion"] = command_term
   motion_names: list[str] = []
   if cfg.motion_file is not None:
-    expanded = os.path.expanduser(cfg.motion_file)
-    if any(c in expanded for c in "*?[]"):
-      files = sorted(glob.glob(expanded))
-    else:
-      files = [expanded]
-    if not files:
-      raise ValueError(f"No motion files matched: {cfg.motion_file}")
-    command_term.motion_file = files
-    motion_names = [Path(f).stem for f in files]
-    print(f"[INFO] Using {len(files)} local motion(s)")
+    command_term.motion_file = resolve_motion_source(cfg.motion_file)
   elif motion_artifacts:
     motion_files = []
     for artifact in motion_artifacts:
@@ -92,12 +106,16 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
   env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=device))
+  if cfg.motion_file is not None:
+    motion_names = env.unwrapped.command_manager.get_term("motion").motion.motion_names
+    print(f"[INFO] Using {len(motion_names)} local motion(s)")
 
   wm = build_world_model(runner_cfg, env, device)
   representation = wm.representation
   dynamics = wm.dynamics
 
-  model_dir = download_model_dir(run)
+  if model_dir is None:
+    model_dir = download_model_dir(run)
   wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
   dynamics.eval()
 
@@ -109,7 +127,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
 
   if cfg.viewer == "auto":
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    resolved = "native" if has_display else "viser"
+    resolved = "native" if has_display and cfg.num_envs == 1 else "viser"
   else:
     resolved = cfg.viewer
   print(f"[INFO] Starting viewer: {resolved}")

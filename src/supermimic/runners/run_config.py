@@ -13,13 +13,15 @@ def load_runner_cfg(run_config: dict[str, Any]) -> SuperMimicRunnerCfg:
   """Reconstruct ``SuperMimicRunnerCfg`` from ``run_config["runner_cfg"]``.
 
   JSON round-tripping turns tuples into lists and erases the ``policy`` union's
-  variant; both are recovered structurally. Unknown keys are ignored and missing
-  fields take today's default with a warning, so runs written by older configs
-  still load; a missing or empty ``runner_cfg`` raises.
+  variant; both are recovered structurally. Unknown keys are ignored. Missing
+  fields use current defaults except for the historical actor observation mode.
   """
   raw = run_config.get("runner_cfg")
   if not raw:
     raise ValueError("run has no serialized runner_cfg; cannot rebuild its config")
+  if "actor_obs" not in raw:
+    raw = {**raw, "actor_obs": "rep_state"}
+    print("[WARN] run cfg missing actor_obs, using historical default 'rep_state'")
   defaulted: list[str] = []
   cfg = _rebuild(SuperMimicRunnerCfg, raw, defaulted, "")
   if defaulted:
